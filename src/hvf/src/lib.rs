@@ -91,7 +91,8 @@ const CNTHCTL_EL2_BITS: u64 = CNTHCTL_EL0VCTEN | CNTHCTL_EL0PCTEN;
 
 const AA64PFR0_EL1_EL2EN: u64 = 1 << 8;
 const AA64PFR0_EL1_GIC3EN: u64 = 1 << 24;
-const AA64PFR1_EL1_SMEMASK: u64 = 3 << 24;
+// ID_AA64PFR1_EL1.SME is the 4-bit field [27:24].
+const AA64PFR1_EL1_SMEMASK: u64 = 0xf << 24;
 
 const EC_WFX_TRAP: u64 = 0x1;
 const EC_AA64_HVC: u64 = 0x16;
@@ -122,6 +123,7 @@ pub enum Error {
     VcpuSetRegister,
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
+    VcpuVtimerOffset,
     VmCreate,
 }
 
@@ -158,6 +160,7 @@ impl Display for Error {
                 "Error setting HVF vCPU system register 0x{reg:#x} to 0x{val:#x}"
             ),
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
+            VcpuVtimerOffset => write!(f, "Error accessing HVF vCPU vtimer offset"),
             VmCreate => write!(f, "Error creating HVF VM instance"),
         }
     }
@@ -369,6 +372,8 @@ pub struct HvfVcpu<'a> {
     pending_mmio_read: Option<MmioRead>,
     pending_advance_pc: bool,
     vtimer_masked: bool,
+    /// CNTVOFF_EL2: the guest's virtual counter is mach_absolute_time() minus this.
+    vtimer_offset: u64,
     nested_enabled: bool,
 }
 
@@ -408,6 +413,12 @@ impl HvfVcpu<'_> {
 
         let vcpu_exit: &hv_vcpu_exit_t = unsafe { vcpu_exit_ptr.as_mut().unwrap() };
 
+        let mut vtimer_offset: u64 = 0;
+        let ret = unsafe { hv_vcpu_get_vtimer_offset(vcpuid, &mut vtimer_offset) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuVtimerOffset);
+        }
+
         Ok(Self {
             vcpuid,
             vcpu_exit,
@@ -416,8 +427,25 @@ impl HvfVcpu<'_> {
             pending_mmio_read: None,
             pending_advance_pc: false,
             vtimer_masked: false,
+            vtimer_offset,
             nested_enabled,
         })
+    }
+
+    /// The guest's virtual counter offset (CNTVOFF_EL2) in host counter ticks.
+    pub fn vtimer_offset(&self) -> u64 {
+        self.vtimer_offset
+    }
+
+    /// Set the virtual counter offset (on the vCPU's own thread, outside hv_vcpu_run): the
+    /// guest's virtual counter becomes mach_absolute_time() - `offset`.
+    pub fn set_vtimer_offset(&mut self, offset: u64) -> Result<(), Error> {
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, offset) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuVtimerOffset);
+        }
+        self.vtimer_offset = offset;
+        Ok(())
     }
 
     pub fn set_initial_state(
@@ -507,30 +535,6 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
-
-            // If SME is enabled in ID_AA64PFR1_EL1 in the VM, the guest will
-            // break after enabling the MMU. Mask it out.
-            let val: u64 = 0;
-            let ret = unsafe {
-                hv_vcpu_get_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    &val as *const _ as *mut _,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
-            let ret = unsafe {
-                hv_vcpu_set_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    val & !AA64PFR1_EL1_SMEMASK,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
         } else {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL1_FAULT_BITS_64)
@@ -538,6 +542,34 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
+        }
+
+        // Masked on every vCPU, not just the nested ones. Apple silicon from M4
+        // on implements SME without SVE; a guest told it has SME uses it, and
+        // guest userspace assumes SVE comes with it (Chromium/CEF's SME path
+        // issues a non-streaming SVE instruction and takes a SIGILL). Under
+        // nested virt the same advertisement breaks the guest once it enables
+        // the MMU, which is why this mask used to live in the nested branch.
+        let mut val: u64 = 0;
+        let ret = unsafe {
+            hv_vcpu_get_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                &mut val as *mut _,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
+        }
+        let ret = unsafe {
+            hv_vcpu_set_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                val & !AA64PFR1_EL1_SMEMASK,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
         }
 
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_PC, entry_addr) };
@@ -792,7 +824,8 @@ impl HvfVcpu<'_> {
 
                 // Also CNTV_CVAL & CNTV_CVAL_EL0
                 let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                let now = unsafe { mach_absolute_time() };
+                // CNTV_CVAL is in virtual counter ticks.
+                let now = unsafe { mach_absolute_time() }.wrapping_sub(self.vtimer_offset);
                 if now > cval {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }

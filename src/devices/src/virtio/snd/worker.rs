@@ -19,7 +19,7 @@ use super::virtio_sound::{
     VIRTIO_SND_S_OK,
 };
 use super::{
-    BackendType, Direction, Error, VirtioSoundChmapInfo, VirtioSoundJackInfo, Vring,
+    BackendType, Direction, Error, SndControl, VirtioSoundChmapInfo, VirtioSoundJackInfo, Vring,
     VIRTIO_SND_CHMAP_FL, VIRTIO_SND_CHMAP_FR, VIRTIO_SND_CHMAP_MAX_SIZE, VIRTIO_SND_CHMAP_NONE,
 };
 use crate::virtio::snd::stream::Buffer;
@@ -45,8 +45,10 @@ impl SndWorker {
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         stop_fd: EventFd,
+        control: Arc<SndControl>,
     ) -> Self {
-        let streams = vec![
+        #[allow(unused_mut)]
+        let mut streams = vec![
             Stream {
                 id: 0,
                 direction: Direction::Output,
@@ -58,12 +60,22 @@ impl SndWorker {
                 ..Stream::default()
             },
         ];
+        #[cfg(target_os = "macos")]
+        {
+            streams[0].channels_max = control.playback_maps().len() as u8;
+            streams[1].channels_max = 2;
+        }
         let streams_no = streams.len();
         let streams = Arc::new(RwLock::new(streams));
         let jacks: Arc<RwLock<Vec<VirtioSoundJackInfo>>> = Arc::new(RwLock::new(Vec::new()));
-        let mut positions = [VIRTIO_SND_CHMAP_NONE; VIRTIO_SND_CHMAP_MAX_SIZE];
-        positions[0] = VIRTIO_SND_CHMAP_FL;
-        positions[1] = VIRTIO_SND_CHMAP_FR;
+        #[cfg(not(target_os = "macos"))]
+        let positions = {
+            let mut positions = [VIRTIO_SND_CHMAP_NONE; VIRTIO_SND_CHMAP_MAX_SIZE];
+            positions[0] = VIRTIO_SND_CHMAP_FL;
+            positions[1] = VIRTIO_SND_CHMAP_FR;
+            positions
+        };
+        #[cfg(not(target_os = "macos"))]
         let chmaps_info: Vec<VirtioSoundChmapInfo> = vec![
             VirtioSoundChmapInfo {
                 direction: VIRTIO_SND_D_OUTPUT,
@@ -78,10 +90,34 @@ impl SndWorker {
                 ..VirtioSoundChmapInfo::default()
             },
         ];
+        #[cfg(target_os = "macos")]
+        let chmaps_info: Vec<VirtioSoundChmapInfo> = control
+            .playback_maps()
+            .iter()
+            .map(|map| (VIRTIO_SND_D_OUTPUT, map.clone()))
+            .chain([
+                (VIRTIO_SND_D_INPUT, vec![super::VIRTIO_SND_CHMAP_MONO]),
+                (
+                    VIRTIO_SND_D_INPUT,
+                    vec![VIRTIO_SND_CHMAP_FL, VIRTIO_SND_CHMAP_FR],
+                ),
+            ])
+            .map(|(direction, map)| {
+                let mut positions = [VIRTIO_SND_CHMAP_NONE; VIRTIO_SND_CHMAP_MAX_SIZE];
+                positions[..map.len()].copy_from_slice(&map);
+                VirtioSoundChmapInfo {
+                    direction,
+                    channels: map.len() as u8,
+                    positions,
+                    ..VirtioSoundChmapInfo::default()
+                }
+            })
+            .collect();
         let chmaps: Arc<RwLock<Vec<VirtioSoundChmapInfo>>> = Arc::new(RwLock::new(chmaps_info));
 
-        let audio_backend =
-            RwLock::new(alloc_audio_backend(BackendType::Pipewire, streams.clone()).unwrap());
+        let audio_backend = RwLock::new(
+            alloc_audio_backend(BackendType::default(), streams.clone(), control).unwrap(),
+        );
 
         let mut vrings: Vec<Arc<Mutex<Vring>>> = Vec::new();
         let mut queue_events: Vec<Arc<EventFd>> = Vec::new();
@@ -270,7 +306,24 @@ impl SndWorker {
             code: VIRTIO_SND_S_OK.into(),
         };
 
-        let code = ControlMessageKind::try_from(request.code.to_native()).unwrap();
+        let code = match ControlMessageKind::try_from(request.code.to_native()) {
+            Ok(code) => code,
+            Err(err) => {
+                log::warn!("snd: {err}");
+                resp.code = VIRTIO_SND_S_NOT_SUPP.into();
+                self.mem
+                    .write_obj(resp, desc_hdr.addr)
+                    .map_err(|_| Error::DescriptorWriteFailed)?;
+                if let Err(err) = vring_lock.lock().unwrap().queue.add_used(
+                    &self.mem,
+                    head.index,
+                    resp.as_slice().len() as u32,
+                ) {
+                    error!("Error adding used descriptors to the queue: {err}");
+                }
+                return Ok(());
+            }
+        };
         match code {
             ControlMessageKind::ChmapInfo => {
                 if descriptors.len() != 3 {
@@ -434,12 +487,8 @@ impl SndWorker {
                 if stream_id as usize >= self.streams_no {
                     log::error!("{}", Error::from(StreamError::InvalidStreamId(stream_id)));
                     resp.code = VIRTIO_SND_S_BAD_MSG.into();
-                } else {
-                    self.audio_backend
-                        .write()
-                        .unwrap()
-                        .prepare(stream_id)
-                        .unwrap();
+                } else if let Err(err) = self.audio_backend.write().unwrap().prepare(stream_id) {
+                    resp.code = backend_error_code(err);
                 }
             }
             ControlMessageKind::PcmRelease => {
@@ -474,12 +523,8 @@ impl SndWorker {
                 if stream_id as usize >= self.streams_no {
                     log::error!("{}", Error::from(StreamError::InvalidStreamId(stream_id)));
                     resp.code = VIRTIO_SND_S_BAD_MSG.into();
-                } else {
-                    self.audio_backend
-                        .write()
-                        .unwrap()
-                        .start(stream_id)
-                        .unwrap();
+                } else if let Err(err) = self.audio_backend.write().unwrap().start(stream_id) {
+                    resp.code = backend_error_code(err);
                 }
             }
             ControlMessageKind::PcmStop => {
@@ -492,8 +537,8 @@ impl SndWorker {
                 if stream_id as usize >= self.streams_no {
                     log::error!("{}", Error::from(StreamError::InvalidStreamId(stream_id)));
                     resp.code = VIRTIO_SND_S_BAD_MSG.into();
-                } else {
-                    self.audio_backend.write().unwrap().stop(stream_id).unwrap();
+                } else if let Err(err) = self.audio_backend.write().unwrap().stop(stream_id) {
+                    resp.code = backend_error_code(err);
                 }
             }
         }
@@ -527,7 +572,9 @@ impl SndWorker {
         _vring_lock: &Arc<Mutex<Vring>>,
         _head: DescriptorChain,
     ) -> result::Result<(), Error> {
-        error!("virtio_snd: unimplemented process_evt");
+        // The driver pre-posts event buffers. No jack or control ever raises an event, so they
+        // are consumed and never returned.
+        debug!("virtio_snd: event buffer posted");
         Ok(())
     }
 
@@ -601,6 +648,18 @@ impl SndWorker {
                         .read_obj::<VirtioSoundPcmXfer>(descriptor.addr)
                         .map_err(|_| Error::DescriptorReadFailed)?;
                     let stream_id: u32 = xfer.stream_id.into();
+                    let valid = self
+                        .streams
+                        .read()
+                        .unwrap()
+                        .get(stream_id as usize)
+                        .is_some_and(|s| s.direction == direction);
+                    if !valid {
+                        message
+                            .status
+                            .store(VIRTIO_SND_S_BAD_MSG, std::sync::atomic::Ordering::SeqCst);
+                        return Err(Error::from(StreamError::InvalidStreamId(stream_id)));
+                    }
                     stream_ids.insert(stream_id);
 
                     state = IoState::WaitingBufferForStreamId(stream_id);
@@ -639,10 +698,24 @@ impl SndWorker {
         if !stream_ids.is_empty() {
             let b = self.audio_backend.read().unwrap();
             for id in stream_ids {
-                b.write(id).unwrap();
+                if let Err(err) = b.write(id) {
+                    log::warn!("snd: stream {id}: {err}");
+                }
             }
         }
 
         Ok(())
+    }
+}
+
+/// Status code for a failed PCM control request.
+fn backend_error_code(err: Error) -> vm_memory::Le32 {
+    match err {
+        Error::Stream(_) | Error::StreamWithIdNotFound(_) => VIRTIO_SND_S_BAD_MSG.into(),
+        Error::UnexpectedAudioBackendConfiguration => VIRTIO_SND_S_NOT_SUPP.into(),
+        err => {
+            log::error!("snd: {err}");
+            VIRTIO_SND_S_IO_ERR.into()
+        }
     }
 }

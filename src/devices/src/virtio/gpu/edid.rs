@@ -25,6 +25,12 @@ const DEFAULT_HORIZONTAL_FRONT_PORCH: u16 = 64;
 const DEFAULT_VERTICAL_FRONT_PORCH: u16 = 1;
 const DEFAULT_HORIZONTAL_SYNC_PULSE: u16 = 192;
 const DEFAULT_VERTICAL_SYNC_PULSE: u16 = 3;
+// CVT reduced blanking, for modes whose pixel clock does not fit otherwise.
+const REDUCED_HORIZONTAL_BLANKING: u16 = 160;
+const REDUCED_HORIZONTAL_FRONT_PORCH: u16 = 48;
+const REDUCED_HORIZONTAL_SYNC_PULSE: u16 = 32;
+// Largest pixel clock (10 kHz units) the detailed timing holds, rounded down to 100 kHz.
+const MAX_PIXEL_CLOCK: u64 = 65530;
 const MILLIMETERS_PER_INCH: f32 = 25.4;
 
 #[derive(Copy, Clone)]
@@ -55,7 +61,7 @@ impl EdidInfo {
             PhysicalSize::DimensionsMillimeters(width, height) => (width, height),
         };
 
-        Self {
+        let mut info = Self {
             width,
             height,
             refresh_rate: params.refresh_rate,
@@ -67,15 +73,37 @@ impl EdidInfo {
             vertical_sync: DEFAULT_VERTICAL_SYNC_PULSE,
             width_millimeters,
             height_millimeters,
+        };
+        // The pixel clock field is 16 bits of 10 kHz. Modes that do not fit with
+        // the default blanking get CVT reduced blanking (160 pixels).
+        if info.wanted_pixel_clock() > MAX_PIXEL_CLOCK {
+            info.horizontal_blanking = REDUCED_HORIZONTAL_BLANKING;
+            info.horizontal_front = REDUCED_HORIZONTAL_FRONT_PORCH;
+            info.horizontal_sync = REDUCED_HORIZONTAL_SYNC_PULSE;
         }
+        info
+    }
+
+    /// Pixel clock in 10 kHz units for the refresh rate, rounded to 100 kHz.
+    fn wanted_pixel_clock(&self) -> u64 {
+        let htotal = u64::from(self.width) + u64::from(self.horizontal_blanking);
+        let vtotal = u64::from(self.height) + u64::from(self.vertical_blanking);
+        let clock = u64::from(self.refresh_rate) * htotal * vtotal / 10000;
+        (clock + 5) / 10 * 10
+    }
+
+    /// The pixel clock stored in the EDID: clamped to the field, which lowers
+    /// the refresh rate of modes too large for it even with reduced blanking.
+    fn pixel_clock(&self) -> u16 {
+        self.wanted_pixel_clock().min(MAX_PIXEL_CLOCK) as u16
     }
 
     pub fn width_centimeters(&self) -> u8 {
-        (self.width_millimeters / 10) as u8
+        (self.width_millimeters / 10).min(u8::MAX.into()) as u8
     }
 
     pub fn height_centimeters(&self) -> u8 {
-        (self.height_millimeters / 10) as u8
+        (self.height_millimeters / 10).min(u8::MAX.into()) as u8
     }
 
     pub fn bytes(self) -> Box<[u8]> {
@@ -148,11 +176,7 @@ fn populate_detailed_timing(edid_block: &mut [u8], info: &EdidInfo) {
     //    if flags & DBLSCAN: refresh /= 2
     //    if vscan > 1: refresh /= vscan
     //
-    let htotal = info.width + (info.horizontal_blanking as u32);
-    let vtotal = info.height + (info.vertical_blanking as u32);
-    let mut clock: u16 = ((info.refresh_rate * htotal * vtotal) / 10000) as u16;
-    // Round to nearest 10khz.
-    clock = ((clock + 5) / 10) * 10;
+    let clock = info.pixel_clock();
     edid_block[0..2].copy_from_slice(&clock.to_le_bytes());
 
     let width_lsb: u8 = (info.width & 0xFF) as u8;

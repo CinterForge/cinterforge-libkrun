@@ -1,12 +1,22 @@
 // Manos Pitsidianakis <manos.pitsidianakis@linaro.org>
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
 
+#[cfg(target_os = "macos")]
+mod channel_layout;
+#[cfg(target_os = "macos")]
+mod coreaudio;
+#[cfg(target_os = "linux")]
 mod pipewire;
 
 use std::sync::{Arc, RwLock};
 
+#[cfg(target_os = "macos")]
+use self::coreaudio::CoreAudioBackend;
+#[cfg(target_os = "macos")]
+pub use self::coreaudio::{output_device_exists, playback_maps};
+#[cfg(target_os = "linux")]
 use self::pipewire::PwBackend;
-use super::{stream::Stream, BackendType, Result, VirtioSndPcmSetParams};
+use super::{stream::Stream, BackendType, Result, SndControl, VirtioSndPcmSetParams};
 
 pub trait AudioBackend {
     fn write(&self, stream_id: u32) -> Result<()>;
@@ -41,10 +51,14 @@ pub trait AudioBackend {
 pub fn alloc_audio_backend(
     backend: BackendType,
     streams: Arc<RwLock<Vec<Stream>>>,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] control: Arc<SndControl>,
 ) -> Result<Box<dyn AudioBackend + Send + Sync>> {
     log::trace!("allocating audio backend {backend:?}");
     match backend {
+        #[cfg(target_os = "linux")]
         BackendType::Pipewire => Ok(Box::new(PwBackend::new(streams))),
+        #[cfg(target_os = "macos")]
+        BackendType::CoreAudio => Ok(Box::new(CoreAudioBackend::new(streams, control)?)),
     }
 }
 

@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::result;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
@@ -20,7 +21,7 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use hvf::{vcpu_request_exit, HvfVcpu, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -172,6 +173,161 @@ pub struct VcpuConfig {
     pub cpu_template: Option<CpuFeaturesTemplate>,
 }
 
+extern "C" {
+    fn mach_absolute_time() -> u64;
+}
+
+/// Pause and resume of a running guest (krun_pause / krun_resume).
+///
+/// Pausing kicks every vCPU out of hv_vcpu_run (hv_vcpus_exit) and parks its thread on a
+/// condvar before it would enter the guest again, so a paused VM runs no guest code and its
+/// vCPU threads use no CPU. The paused interval is hidden from the guest: on resume every
+/// vCPU adds it to its virtual counter offset (CNTVOFF_EL2) before re-entering the guest, so
+/// CLOCK_MONOTONIC, timers and the kernel's watchdogs (soft lockup, RCU stall, workqueue
+/// lockup) see no gap, as with QEMU's default for KVM/HVF on arm64. CLOCK_REALTIME stays
+/// behind by the paused time until the guest's NTP client steps it.
+pub struct VmPause {
+    vcpu_count: usize,
+    /// Fast-path flag read by every vCPU before entering the guest.
+    paused: AtomicBool,
+    /// Bumped by every resume: a vCPU that has not applied the current offset yet does so
+    /// before entering the guest (also vCPUs that were blocked in WFE/boot, not parked).
+    generation: AtomicU64,
+    /// vCPUs outside the guest without being parked: waiting for CPU_ON or in a WFE wait.
+    idle: AtomicUsize,
+    state: Mutex<PauseState>,
+    cond: Condvar,
+    /// HVF ids of the started vCPUs (hv_vcpus_exit targets).
+    vcpus: Mutex<Vec<u64>>,
+    /// STEAMAC_PAUSE_CLOCK=running: let the guest's counter run on while paused (the guest
+    /// sees the paused time as a jump of its monotonic clock), for comparison.
+    hide_paused_time: bool,
+}
+
+#[derive(Default)]
+struct PauseState {
+    paused: bool,
+    parked: usize,
+    /// Host counter when the last vCPU left the guest.
+    since: u64,
+    /// Paused time hidden from the guest so far, in counter ticks.
+    hidden_ticks: u64,
+}
+
+impl VmPause {
+    /// Longest krun_pause waits for the vCPUs to leave the guest.
+    const STOP_TIMEOUT: Duration = Duration::from_secs(1);
+
+    pub fn new(vcpu_count: usize) -> Self {
+        Self {
+            vcpu_count,
+            paused: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            idle: AtomicUsize::new(0),
+            state: Mutex::new(PauseState::default()),
+            cond: Condvar::new(),
+            vcpus: Mutex::new(Vec::with_capacity(vcpu_count)),
+            hide_paused_time: std::env::var_os("STEAMAC_PAUSE_CLOCK")
+                .is_none_or(|v| v != "running"),
+        }
+    }
+
+    /// Stop all vCPUs; returns once none is in the guest (or after STOP_TIMEOUT, logged).
+    /// Returns false if the VM was paused already.
+    pub fn pause(&self) -> bool {
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.paused {
+                return false;
+            }
+            st.paused = true;
+            self.paused.store(true, Ordering::SeqCst);
+        }
+        for &id in self.vcpus.lock().unwrap().iter() {
+            // A vCPU that is not in hv_vcpu_run gets a pending exit: one Canceled exit later.
+            let _ = vcpu_request_exit(id);
+        }
+        let deadline = Instant::now() + Self::STOP_TIMEOUT;
+        let mut st = self.state.lock().unwrap();
+        while st.parked + self.idle.load(Ordering::SeqCst) < self.vcpu_count {
+            let now = Instant::now();
+            if now >= deadline {
+                warn!(
+                    "pause: {} of {} vCPUs still running after {:?}",
+                    self.vcpu_count - st.parked - self.idle.load(Ordering::SeqCst),
+                    self.vcpu_count,
+                    Self::STOP_TIMEOUT
+                );
+                break;
+            }
+            // Idle vCPUs do not notify: poll them at a short interval.
+            let wait = (deadline - now).min(Duration::from_millis(5));
+            st = self.cond.wait_timeout(st, wait).unwrap().0;
+        }
+        // SAFETY: plain counter read.
+        st.since = unsafe { mach_absolute_time() };
+        true
+    }
+
+    /// Let the vCPUs run again. Returns false if the VM was not paused.
+    pub fn resume(&self) -> bool {
+        let mut st = self.state.lock().unwrap();
+        if !st.paused {
+            return false;
+        }
+        if self.hide_paused_time {
+            // SAFETY: plain counter read.
+            let now = unsafe { mach_absolute_time() };
+            st.hidden_ticks += now.saturating_sub(st.since);
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        st.paused = false;
+        self.paused.store(false, Ordering::SeqCst);
+        self.cond.notify_all();
+        true
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    fn register(&self, hvf_vcpuid: u64) {
+        self.vcpus.lock().unwrap().push(hvf_vcpuid);
+    }
+
+    fn enter_idle(&self) {
+        self.idle.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn leave_idle(&self) {
+        self.idle.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Called by a vCPU thread before it enters the guest: parks while paused, then makes
+    /// sure the vCPU's virtual counter offset hides every paused interval so far.
+    fn before_run(&self, hvf_vcpu: &mut HvfVcpu, base_offset: u64, applied_generation: &mut u64) {
+        if self.paused.load(Ordering::SeqCst) {
+            let mut st = self.state.lock().unwrap();
+            if st.paused {
+                st.parked += 1;
+                self.cond.notify_all();
+                while st.paused {
+                    st = self.cond.wait(st).unwrap();
+                }
+                st.parked -= 1;
+            }
+        }
+        let generation = self.generation.load(Ordering::SeqCst);
+        if generation != *applied_generation {
+            let hidden = self.state.lock().unwrap().hidden_ticks;
+            if let Err(e) = hvf_vcpu.set_vtimer_offset(base_offset.wrapping_add(hidden)) {
+                error!("vCPU {}: {e}", hvf_vcpu.id());
+            }
+            *applied_generation = generation;
+        }
+    }
+}
+
 // Using this for easier explicit type-casting to help IDEs interpret the code.
 type VcpuCell = Cell<Option<*const Vcpu>>;
 
@@ -201,6 +357,7 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    pause: Arc<VmPause>,
 }
 
 impl Vcpu {
@@ -276,6 +433,7 @@ impl Vcpu {
         exit_evt: EventFd,
         vcpu_list: Arc<VcpuList>,
         nested_enabled: bool,
+        pause: Arc<VmPause>,
     ) -> Result<Self> {
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
@@ -296,6 +454,7 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            pause,
         })
     }
 
@@ -339,6 +498,7 @@ impl Vcpu {
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.cpu_index()))
             .spawn(move || {
+                utils::macos::set_thread_qos_user_interactive();
                 self.init_thread_local_data()
                     .expect("Cannot cleanly initialize vcpu TLS.");
 
@@ -449,9 +609,13 @@ impl Vcpu {
 
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
+        self.pause.register(hvf_vcpuid);
 
         let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
+            self.pause.enter_idle();
+            let entry = boot_receiver.recv().unwrap();
+            self.pause.leave_idle();
+            entry
         } else {
             self.boot_entry_addr
         };
@@ -460,7 +624,11 @@ impl Vcpu {
             .set_initial_state(self.ipa_size, entry_addr, self.fdt_addr)
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
 
+        let base_offset = hvf_vcpu.vtimer_offset();
+        let mut applied_generation = 0;
         loop {
+            self.pause
+                .before_run(&mut hvf_vcpu, base_offset, &mut applied_generation);
             match self.run_emulation(&mut hvf_vcpu) {
                 // Emulation ran successfully, continue.
                 Ok(VcpuEmulation::Handled) => (),
@@ -495,6 +663,7 @@ impl Vcpu {
         timeout: Option<Duration>,
     ) {
         if self.vcpu_list.should_wait(hvf_vcpuid) {
+            self.pause.enter_idle();
             if let Some(timeout) = timeout {
                 match receiver.recv_timeout(timeout) {
                     Ok(_) => {}
@@ -506,6 +675,7 @@ impl Vcpu {
             } else {
                 receiver.recv().unwrap();
             }
+            self.pause.leave_idle();
         }
     }
 

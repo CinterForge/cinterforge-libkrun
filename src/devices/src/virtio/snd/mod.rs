@@ -1,5 +1,6 @@
 use std::{
     io::Error as IoError,
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     sync::{Arc, Mutex},
 };
 
@@ -16,6 +17,119 @@ use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 pub use self::defs::uapi::VIRTIO_ID_SND as TYPE_SND;
 pub use self::device::Snd;
 pub use stream::Stream;
+
+#[cfg(target_os = "macos")]
+pub use self::audio_backends::output_device_exists;
+
+/// Host-side audio settings changed at runtime (krun_snd_set_*), shared between the embedder
+/// and the audio backend. Every change bumps `generation` and wakes the backend.
+pub struct SndControl {
+    #[cfg(target_os = "macos")]
+    playback_maps: std::sync::OnceLock<Vec<Vec<u8>>>,
+    /// CoreAudio device UID of the output, None = the system default (followed).
+    output_device: Mutex<Option<String>>,
+    gain: AtomicU32,
+    mute: AtomicBool,
+    buffer_ms: AtomicU32,
+    /// The VM is paused (krun_pause): the backend stops its audio units.
+    paused: AtomicBool,
+    generation: AtomicU64,
+    waker: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+impl Default for SndControl {
+    fn default() -> Self {
+        Self {
+            #[cfg(target_os = "macos")]
+            playback_maps: std::sync::OnceLock::new(),
+            output_device: Mutex::new(None),
+            gain: AtomicU32::new(1.0f32.to_bits()),
+            mute: AtomicBool::new(false),
+            buffer_ms: AtomicU32::new(SndControl::DEFAULT_BUFFER_MS),
+            paused: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            waker: Mutex::new(None),
+        }
+    }
+}
+
+impl SndControl {
+    /// Frozen when the guest first reads config; virtio-snd/ALSA cache PCM capabilities.
+    #[cfg(target_os = "macos")]
+    pub fn playback_maps(&self) -> &Vec<Vec<u8>> {
+        self.playback_maps
+            .get_or_init(|| audio_backends::playback_maps(self))
+    }
+
+    /// Measured in a SteamOS guest: PipeWire stalls of 25-40 ms under load (Steam startup)
+    /// starve a smaller host buffer.
+    pub const DEFAULT_BUFFER_MS: u32 = 40;
+    pub const MAX_BUFFER_MS: u32 = 200;
+
+    pub fn set_output_device(&self, uid: Option<String>) {
+        *self.output_device.lock().unwrap() = uid;
+        self.changed();
+    }
+
+    pub fn output_device(&self) -> Option<String> {
+        self.output_device.lock().unwrap().clone()
+    }
+
+    /// `gain` must be within 0..=1.
+    pub fn set_volume(&self, gain: f32, mute: bool) {
+        self.gain.store(gain.to_bits(), Ordering::Relaxed);
+        self.mute.store(mute, Ordering::Relaxed);
+        self.changed();
+    }
+
+    /// Effective linear gain (0 when muted).
+    pub fn volume(&self) -> f32 {
+        if self.mute.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            f32::from_bits(self.gain.load(Ordering::Relaxed))
+        }
+    }
+
+    /// `ms` must be at most MAX_BUFFER_MS.
+    pub fn set_buffer_ms(&self, ms: u32) {
+        self.buffer_ms.store(ms, Ordering::Relaxed);
+        self.changed();
+    }
+
+    pub fn buffer_ms(&self) -> u32 {
+        self.buffer_ms.load(Ordering::Relaxed)
+    }
+
+    /// While the VM is paused the backend stops its CoreAudio units: no output (and no
+    /// microphone use), and the guest's streams do not advance, so they carry on without
+    /// underruns on resume.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+        self.changed();
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Called by the backend: run `waker` after every change.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn set_waker(&self, waker: Box<dyn Fn() + Send + Sync>) {
+        *self.waker.lock().unwrap() = Some(waker);
+    }
+
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(wake) = self.waker.lock().unwrap().as_ref() {
+            wake();
+        }
+    }
+}
 use virtio_sound::*;
 
 use super::{Descriptor, InterruptTransport, Queue};
@@ -36,6 +150,15 @@ mod defs {
     const QUEUE_SIZE: u16 = 256;
     pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZE); NUM_QUEUES];
 
+    // The CoreAudio backend hands the guest's own format to the output unit, which converts
+    // to the device: advertise the formats PipeWire picks (FLOAT/S32 first, S16 for plain ALSA
+    // clients) at the usual rates, stereo or mono.
+    #[cfg(target_os = "macos")]
+    pub const SUPPORTED_FORMATS: u64 = (1 << VIRTIO_SND_PCM_FMT_U8)
+        | (1 << VIRTIO_SND_PCM_FMT_S16)
+        | (1 << VIRTIO_SND_PCM_FMT_S32)
+        | (1 << VIRTIO_SND_PCM_FMT_FLOAT);
+    #[cfg(not(target_os = "macos"))]
     pub const SUPPORTED_FORMATS: u64 = (1 << VIRTIO_SND_PCM_FMT_U8)
         | (1 << VIRTIO_SND_PCM_FMT_S16)
         | (1 << VIRTIO_SND_PCM_FMT_S24)
@@ -48,6 +171,13 @@ mod defs {
         | (1 << VIRTIO_SND_PCM_RATE_32000)
         | (1 << VIRTIO_SND_PCM_RATE_44100)
         | (1 << VIRTIO_SND_PCM_RATE_48000);
+
+    pub const CHANNELS_MIN: u8 = 1;
+    /// Upper bound only: the worker narrows playback to the boot layout and capture to stereo.
+    #[cfg(target_os = "macos")]
+    pub const CHANNELS_MAX: u8 = 12;
+    #[cfg(not(target_os = "macos"))]
+    pub const CHANNELS_MAX: u8 = 6;
 
     pub mod uapi {
         pub const VIRTIO_F_VERSION_1: u32 = 32;
@@ -149,10 +279,21 @@ impl From<stream::Error> for Error {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendType {
-    #[default]
+    #[cfg(target_os = "linux")]
     Pipewire,
+    #[cfg(target_os = "macos")]
+    CoreAudio,
+}
+
+impl Default for BackendType {
+    fn default() -> Self {
+        #[cfg(target_os = "linux")]
+        return Self::Pipewire;
+        #[cfg(target_os = "macos")]
+        return Self::CoreAudio;
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

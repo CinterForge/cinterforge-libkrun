@@ -141,13 +141,13 @@ pub const VIRTIO_SND_CHMAP_TRR: u8 = 26; /* top rear right */
 pub const VIRTIO_SND_CHMAP_TRC: u8 = 27; /* top rear center */
 pub const VIRTIO_SND_CHMAP_TFLC: u8 = 28; /* top front left center */
 pub const VIRTIO_SND_CHMAP_TFRC: u8 = 29; /* top front right center */
-pub const VIRTIO_SND_CHMAP_TSL: u8 = 34; /* top side left */
-pub const VIRTIO_SND_CHMAP_TSR: u8 = 35; /* top side right */
-pub const VIRTIO_SND_CHMAP_LLFE: u8 = 36; /* left LFE */
-pub const VIRTIO_SND_CHMAP_RLFE: u8 = 37; /* right LFE */
-pub const VIRTIO_SND_CHMAP_BC: u8 = 38; /* bottom center */
-pub const VIRTIO_SND_CHMAP_BLC: u8 = 39; /* bottom left center */
-pub const VIRTIO_SND_CHMAP_BRC: u8 = 40; /* bottom right center */
+pub const VIRTIO_SND_CHMAP_TSL: u8 = 30; /* top side left */
+pub const VIRTIO_SND_CHMAP_TSR: u8 = 31; /* top side right */
+pub const VIRTIO_SND_CHMAP_LLFE: u8 = 32; /* left LFE */
+pub const VIRTIO_SND_CHMAP_RLFE: u8 = 33; /* right LFE */
+pub const VIRTIO_SND_CHMAP_BC: u8 = 34; /* bottom center */
+pub const VIRTIO_SND_CHMAP_BLC: u8 = 35; /* bottom left center */
+pub const VIRTIO_SND_CHMAP_BRC: u8 = 36; /* bottom right center */
 // maximum possible number of channels
 pub const VIRTIO_SND_CHMAP_MAX_SIZE: usize = 18;
 

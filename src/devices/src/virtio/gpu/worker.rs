@@ -22,7 +22,7 @@ use super::protocol::{
     virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry, GpuCommand, GpuResponse, VirtioGpuResult,
 };
 use super::virtio_gpu::VirtioGpu;
-use crate::virtio::display::DisplayInfo;
+use crate::virtio::display::{DisplayControl, DisplayInfo};
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::{VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX};
 use crate::virtio::gpu::virtio_gpu::VirtioGpuRing;
@@ -43,6 +43,51 @@ pub struct Worker {
     export_table: Option<ExportTable>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
+    display_control: Arc<DisplayControl>,
+}
+
+/// Clones a queue eventfd so we have our own file description, set to blocking mode.
+fn blocking_eventfd(event: &EventFd) -> EventFd {
+    let evt = event.try_clone().unwrap();
+    // SAFETY: evt is valid for the duration of the fcntl calls.
+    let fd = unsafe { BorrowedFd::borrow_raw(evt.as_raw_fd()) };
+    let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
+    fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
+    evt
+}
+
+/// Completes every cursor command without acting on it, on its own thread.
+/// There is no cursor plane in the display backend API (the host shows its own
+/// pointer), but the guest driver blocks its atomic commits once the cursor
+/// queue is full, so the queue has to keep moving.
+pub fn spawn_cursor_drain(
+    cursor_q: DeviceQueue,
+    mem: GuestMemoryMmap,
+    interrupt: InterruptTransport,
+) {
+    let evt = blocking_eventfd(&cursor_q.event);
+    let mut queue = cursor_q.queue;
+    thread::Builder::new()
+        .name("gpu cursor".into())
+        .spawn(move || loop {
+            if let Err(e) = evt.read() {
+                error!("Failed to read cursor_evt: {e:?}");
+                continue;
+            }
+            let mut used_any = false;
+            while let Some(head) = queue.pop(&mem) {
+                if let Err(e) = queue.add_used(&mem, head.index, 0) {
+                    error!("failed to add used elements to the cursor queue: {e:?}");
+                }
+                used_any = true;
+            }
+            if used_any {
+                if let Err(e) = interrupt.try_signal_used_queue() {
+                    error!("Error signaling cursor queue: {e:?}");
+                }
+            }
+        })
+        .unwrap();
 }
 
 impl Worker {
@@ -58,17 +103,10 @@ impl Worker {
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
+        display_control: Arc<DisplayControl>,
     ) -> Self {
-        // Clone the eventfd so we have our own file description, then set it to blocking mode.
-        let control_evt = control_q.event.try_clone().unwrap();
-        // SAFETY: control_evt is valid for the duration of the fcntl calls.
-        let fd = unsafe { BorrowedFd::borrow_raw(control_evt.as_raw_fd()) };
-        let flags =
-            OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
-        fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
-
         Self {
-            control_evt,
+            control_evt: blocking_eventfd(&control_q.event),
             control_queue: Arc::new(Mutex::new(control_q.queue)),
             mem,
             interrupt,
@@ -80,6 +118,7 @@ impl Worker {
             export_table,
             displays,
             display_backend,
+            display_control,
         }
     }
 
@@ -91,6 +130,8 @@ impl Worker {
     }
 
     fn work(mut self) {
+        #[cfg(target_os = "macos")]
+        utils::macos::set_thread_qos_user_interactive();
         let mut virtio_gpu = VirtioGpu::new(
             self.mem.clone(),
             self.control_queue.clone(),
@@ -104,10 +145,20 @@ impl Worker {
             self.display_backend,
         );
 
+        // Resizes requested before the driver started: nothing to signal, it
+        // has not asked for the display configuration yet.
+        self.apply_display_resizes(&mut virtio_gpu);
+
         loop {
             if let Err(e) = self.control_evt.read() {
                 error!("Failed to read control_evt: {e:?}");
                 continue;
+            }
+            if self.apply_display_resizes(&mut virtio_gpu) {
+                self.display_control.raise_display_event();
+                if let Err(e) = self.interrupt.try_signal_config_change() {
+                    error!("Error signaling display change: {e:?}");
+                }
             }
             if self.process_queue(&mut virtio_gpu, &self.control_queue.clone()) {
                 if let Err(e) = self.interrupt.try_signal_used_queue() {
@@ -115,6 +166,19 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Applies every queued display resize (a live window resize queues many);
+    /// returns whether the guest-visible configuration changed.
+    fn apply_display_resizes(&self, virtio_gpu: &mut VirtioGpu) -> bool {
+        let mut changed = false;
+        for resize in self.display_control.requests().try_iter() {
+            match virtio_gpu.resize_display(&resize) {
+                Ok(c) => changed |= c,
+                Err(e) => error!("display resize {resize:?} failed: {e:?}"),
+            }
+        }
+        changed
     }
 
     fn process_gpu_command(
@@ -335,8 +399,24 @@ impl Worker {
                     mem,
                 )
             }
-            GpuCommand::SetScanoutBlob(_info) => {
-                panic!("virtio_gpu: GpuCommand::SetScanoutBlob unimplemented");
+            GpuCommand::SetScanoutBlob(info) => {
+                let rect = Rect {
+                    x: info.r.x,
+                    y: info.r.y,
+                    width: info.r.width,
+                    height: info.r.height,
+                };
+                // Only single-plane RGB formats can be scanned out.
+                virtio_gpu.set_scanout_blob(
+                    info.scanout_id,
+                    info.resource_id,
+                    info.width,
+                    info.height,
+                    info.format,
+                    info.strides[0],
+                    info.offsets[0],
+                    rect,
+                )
             }
             GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id;
@@ -362,6 +442,7 @@ impl Worker {
             let head = control_queue.lock().unwrap().pop(&mem);
 
             if let Some(head) = head {
+                self.display_control.note_ctrl_command();
                 let mut reader = Reader::new(&mem, head.clone())
                     .map_err(GpuError::QueueReader)
                     .unwrap();
@@ -398,6 +479,7 @@ impl Worker {
                     let mut ctx_id = 0;
                     let mut flags = 0;
                     let mut ring_idx = 0;
+                    let mut fence_created = false;
                     if let Some(_cmd) = gpu_cmd {
                         let ctrl_hdr = ctrl_hdr.unwrap();
                         if ctrl_hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 {
@@ -413,7 +495,10 @@ impl Worker {
                                 ring_idx,
                             };
                             gpu_response = match virtio_gpu.create_fence(fence) {
-                                Ok(_) => gpu_response,
+                                Ok(_) => {
+                                    fence_created = true;
+                                    gpu_response
+                                }
                                 Err(fence_resp) => {
                                     warn!("create_fence {fence_id} -> {fence_resp:?}");
                                     fence_resp
@@ -429,7 +514,10 @@ impl Worker {
                         Err(e) => debug!("ctrl queue response encode error: {e:?}"),
                     }
 
-                    if flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+                    // A fence the renderer refused will never signal: answer now
+                    // (still flagged, so the guest retires its fence) instead of
+                    // parking the descriptor forever and wedging the queue.
+                    if fence_created {
                         let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
                             0 => VirtioGpuRing::Global,
                             _ => VirtioGpuRing::ContextSpecific { ctx_id, ring_idx },

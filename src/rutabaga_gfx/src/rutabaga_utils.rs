@@ -407,6 +407,11 @@ impl VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_NO_VIRGL, !v)
     }
 
+    /// Whether virgl (the GL renderer) is enabled
+    pub fn uses_virgl(self) -> bool {
+        self.0 & VIRGLRENDERER_NO_VIRGL == 0
+    }
+
     /// Enable venus support
     pub fn use_venus(self, v: bool) -> VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_VENUS, v)
@@ -626,7 +631,6 @@ pub const RUTABAGA_MEM_HANDLE_TYPE_DMABUF: u32 = 0x0002;
 pub const RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0003;
 pub const RUTABAGA_MEM_HANDLE_TYPE_SHM: u32 = 0x0004;
 pub const RUTABAGA_MEM_HANDLE_TYPE_ZIRCON: u32 = 0x0005;
-pub const RUTABAGA_MEM_HANDLE_TYPE_APPLE: u32 = 0x0006;
 
 pub const RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0006;
 pub const RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD: u32 = 0x0007;

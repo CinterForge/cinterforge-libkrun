@@ -7,7 +7,6 @@
 
 #![cfg(feature = "virgl_renderer")]
 
-use std::cmp::min;
 use std::convert::TryFrom;
 use std::io::Error as SysError;
 use std::io::IoSliceMut;
@@ -27,7 +26,6 @@ use log::debug;
 use log::error;
 use log::warn;
 
-use crate::generated::virgl_debug_callback_bindings::*;
 use crate::generated::virgl_renderer_bindings::*;
 use crate::renderer_utils::*;
 use crate::rutabaga_core::RutabagaComponent;
@@ -159,31 +157,33 @@ impl Drop for VirglRendererContext {
     }
 }
 
-extern "C" fn debug_callback(fmt: *const ::std::os::raw::c_char, ap: stdio::va_list) {
-    const BUF_LEN: usize = 256;
-    let mut v = [b' '; BUF_LEN];
+// virglrenderer's level-aware logger (virglrenderer.h, enum virgl_log_level_flags).
+const VIRGL_LOG_LEVEL_DEBUG: u32 = 0;
+const VIRGL_LOG_LEVEL_INFO: u32 = 1;
+const VIRGL_LOG_LEVEL_WARNING: u32 = 2;
 
-    let printed_len = unsafe {
-        let ptr = v.as_mut_ptr() as *mut ::std::os::raw::c_char;
-        #[cfg(any(
-            target_arch = "x86",
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64"
-        ))]
-        let size = BUF_LEN as ::std::os::raw::c_ulong;
-        #[cfg(target_arch = "arm")]
-        let size = BUF_LEN as ::std::os::raw::c_uint;
+extern "C" {
+    fn virgl_set_log_callback(
+        cb: Option<extern "C" fn(u32, *const c_char, *mut c_void)>,
+        user_data: *mut c_void,
+        free_user_data_cb: Option<extern "C" fn(*mut c_void)>,
+    );
+}
 
-        stdio::vsnprintf(ptr, size, fmt, ap)
-    };
-
-    if printed_len < 0 {
-        debug!("rutabaga_gfx::virgl_renderer::debug_callback: vsnprintf returned {printed_len}");
-    } else {
-        // vsnprintf returns the number of chars that *would* have been printed
-        let len = min(printed_len as usize, BUF_LEN - 1);
-        debug!("{}", String::from_utf8_lossy(&v[..len]));
+/// Routes virglrenderer's messages into the VMM's log. Venus explains why it marks a
+/// guest ring fatal (and other protocol errors) at INFO level, and a ring fatal makes
+/// the guest driver abort, so INFO is logged as a warning to be seen by default.
+extern "C" fn log_callback(level: u32, message: *const c_char, _user_data: *mut c_void) {
+    if message.is_null() {
+        return;
+    }
+    // SAFETY: virglrenderer passes a NUL-terminated string valid for this call.
+    let message = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy();
+    let message = message.trim_end();
+    match level {
+        VIRGL_LOG_LEVEL_DEBUG => debug!("virglrenderer: {message}"),
+        VIRGL_LOG_LEVEL_INFO | VIRGL_LOG_LEVEL_WARNING => warn!("virglrenderer: {message}"),
+        _ => error!("virglrenderer: {message}"),
     }
 }
 
@@ -312,7 +312,7 @@ impl VirglRenderer {
             return Err(RutabagaError::AlreadyInUse);
         }
 
-        unsafe { virgl_set_debug_callback(Some(debug_callback)) };
+        unsafe { virgl_set_log_callback(Some(log_callback), null_mut(), None) };
 
         // Cookie is intentionally never freed because virglrenderer never gets uninitialized.
         // Otherwise, Resource and Context would become invalid because their lifetime is not tied
@@ -358,15 +358,6 @@ impl VirglRenderer {
         Err(RutabagaError::Unsupported)
     }
 
-    #[cfg(target_os = "macos")]
-    fn map_ptr(&self, resource_id: u32) -> RutabagaResult<u64> {
-        let mut map_ptr = 0;
-        let ret = unsafe { virgl_renderer_resource_get_map_ptr(resource_id, &mut map_ptr) };
-        ret_to_res(ret)?;
-
-        Ok(map_ptr)
-    }
-
     fn query(&self, resource_id: u32) -> RutabagaResult<Resource3DInfo> {
         let query = export_query(resource_id)?;
         if query.out_num_fds == 0 {
@@ -402,7 +393,6 @@ impl VirglRenderer {
                 VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF => RUTABAGA_MEM_HANDLE_TYPE_DMABUF,
                 VIRGL_RENDERER_BLOB_FD_TYPE_SHM => RUTABAGA_MEM_HANDLE_TYPE_SHM,
                 VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE => RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD,
-                VIRGL_RENDERER_BLOB_FD_TYPE_APPLE => RUTABAGA_MEM_HANDLE_TYPE_APPLE,
                 _ => {
                     return Err(RutabagaError::Unsupported);
                 }
@@ -509,8 +499,6 @@ impl RutabagaComponent for VirglRenderer {
             blob_mem: 0,
             blob_flags: 0,
             map_info: None,
-            #[cfg(target_os = "macos")]
-            map_ptr: None,
             info_2d: None,
             info_3d: self.query(resource_id).ok(),
             vulkan_info: None,
@@ -681,8 +669,6 @@ impl RutabagaComponent for VirglRenderer {
                 blob_mem: resource_create_blob.blob_mem,
                 blob_flags: resource_create_blob.blob_flags,
                 map_info: self.map_info(resource_id).ok(),
-                #[cfg(target_os = "macos")]
-                map_ptr: self.map_ptr(resource_id).ok(),
                 info_2d: None,
                 info_3d: self.query(resource_id).ok(),
                 vulkan_info: None,

@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::os::fd::RawFd;
+use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
@@ -12,8 +13,8 @@ use super::super::{
 use super::defs;
 use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
-use super::worker::Worker;
-use crate::virtio::display::DisplayInfo;
+use super::worker::{spawn_cursor_drain, Worker};
+use crate::virtio::display::{DisplayControl, DisplayInfo};
 use crate::virtio::InterruptTransport;
 use krun_display::DisplayBackend;
 #[cfg(target_os = "macos")]
@@ -25,7 +26,8 @@ pub(crate) const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
     | (1u64 << uapi::VIRTIO_GPU_F_EDID)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_UUID)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_BLOB)
-    | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT);
+    | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT)
+    | (1u64 << uapi::VIRTIO_GPU_F_BLOB_ALIGNMENT);
 
 const QUEUE_SIZE: u16 = 256;
 static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =
@@ -43,6 +45,8 @@ pub struct Gpu {
     export_table: Option<ExportTable>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
+    display_control: Arc<DisplayControl>,
+    blob_alignment: u32,
 }
 
 impl Gpu {
@@ -51,6 +55,7 @@ impl Gpu {
         render_server_fd: Option<RawFd>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
+        display_control: Arc<DisplayControl>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
     ) -> super::Result<Gpu> {
         Ok(Gpu {
@@ -65,6 +70,10 @@ impl Gpu {
             export_table: None,
             displays,
             display_backend,
+            display_control,
+            // Blobs are mapped into the guest in host pages, which can be
+            // larger than the guest's (16 KiB on Apple silicon).
+            blob_alignment: unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32,
         })
     }
 
@@ -164,10 +173,16 @@ impl VirtioDevice for Gpu {
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
         let config = virtio_gpu_config {
-            events_read: 0,
+            // Only an actual read of events_read counts as the driver seeing them.
+            events_read: if offset < 4 {
+                self.display_control.read_events()
+            } else {
+                0
+            },
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
             num_capsets: 5,
+            blob_alignment: self.blob_alignment,
         };
 
         let config_slice = config.as_slice();
@@ -184,6 +199,11 @@ impl VirtioDevice for Gpu {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
+        // events_clear is the only writable field.
+        if let (4, Ok(clear)) = (offset, <[u8; 4]>::try_from(data)) {
+            self.display_control.clear_events(u32::from_le_bytes(clear));
+            return;
+        }
         warn!(
             "gpu: guest driver attempted to write device config (offset={:x}, len={:x})",
             offset,
@@ -197,7 +217,7 @@ impl VirtioDevice for Gpu {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        let [control_q, _cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
+        let [control_q, cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
             error!(
                 "Cannot perform activate. Expected {} queue(s)",
                 defs::NUM_QUEUES
@@ -210,7 +230,11 @@ impl VirtioDevice for Gpu {
             None => panic!("virtio_gpu: missing SHM region"),
         };
 
-        // cursor queue not used by worker
+        spawn_cursor_drain(cursor_q, mem.clone(), interrupt.clone());
+        match control_q.event.try_clone() {
+            Ok(waker) => self.display_control.set_waker(waker),
+            Err(e) => error!("virtio_gpu: no display resize wakeups: {e:?}"),
+        }
         let worker = Worker::new(
             control_q,
             mem.clone(),
@@ -223,6 +247,7 @@ impl VirtioDevice for Gpu {
             self.export_table.take(),
             self.displays.clone(),
             self.display_backend,
+            self.display_control.clone(),
         );
         worker.run();
 
@@ -238,5 +263,34 @@ impl VirtioDevice for Gpu {
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         debug!("virtio_gpu: GET_shm_region");
         self.shm_region.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::display::NoopDisplayBackend;
+    use krun_display::IntoDisplayBackend;
+
+    #[test]
+    fn blob_alignment_offered() {
+        let gpu = Gpu::new(
+            0,
+            None,
+            Box::new([]),
+            NoopDisplayBackend::into_display_backend(None),
+            Arc::new(DisplayControl::new(&[])),
+            #[cfg(target_os = "macos")]
+            crossbeam_channel::unbounded().0,
+        )
+        .unwrap();
+        assert_ne!(
+            gpu.avail_features() & (1 << uapi::VIRTIO_GPU_F_BLOB_ALIGNMENT),
+            0
+        );
+        let mut data = [0u8; 4];
+        gpu.read_config(16, &mut data);
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+        assert_eq!(u32::from_le_bytes(data), page_size);
     }
 }

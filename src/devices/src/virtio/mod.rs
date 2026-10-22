@@ -55,7 +55,7 @@ pub use self::queue::{Descriptor, DescriptorChain, Queue};
 #[cfg(not(feature = "tee"))]
 pub use self::rng::*;
 #[cfg(feature = "snd")]
-pub use self::snd::Snd;
+pub use self::snd::{Snd, SndControl};
 pub use self::vsock::*;
 
 /// When the driver initializes the device, it lets the device know about the

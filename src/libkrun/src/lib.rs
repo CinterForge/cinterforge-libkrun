@@ -65,9 +65,13 @@ use vmm::vmm_config::vsock::VsockDeviceConfig;
 use aws_nitro::enclave::NitroEnclave;
 
 #[cfg(feature = "gpu")]
-use devices::virtio::display::{DisplayInfoEdid, PhysicalSize, MAX_DISPLAYS};
+use devices::virtio::display::{
+    DisplayControl, DisplayInfoEdid, DisplayResize, DisplayResizeError, PhysicalSize, MAX_DISPLAYS,
+};
 #[cfg(feature = "input")]
 use krun_input::{InputConfigBackend, InputEventProviderBackend};
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
 
 // Value returned on success. We use libc's errors otherwise.
 const KRUN_SUCCESS: i32 = 0;
@@ -188,6 +192,8 @@ struct ContextConfig {
     gpu_shm_size: Option<usize>,
     render_server_fd: Option<RawFd>,
     enable_snd: bool,
+    #[cfg(feature = "snd")]
+    snd_control: std::sync::Arc<devices::virtio::SndControl>,
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
@@ -1868,6 +1874,155 @@ pub extern "C" fn krun_display_set_dpi(_ctx_id: u32, _display_id: u32, _dpi: u32
     -libc::ENOTSUP
 }
 
+/// Display controls of started VMs (krun_start_enter consumed their ContextConfig).
+#[cfg(feature = "gpu")]
+static DISPLAY_CONTROLS: Lazy<Mutex<HashMap<u32, Arc<DisplayControl>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// A started context's entry in DISPLAY_CONTROLS, removed when krun_start_enter returns.
+#[cfg(feature = "gpu")]
+struct DisplayControlRegistration(u32);
+
+#[cfg(feature = "gpu")]
+impl DisplayControlRegistration {
+    fn new(ctx_id: u32, ctx_cfg: &mut ContextConfig) -> Self {
+        if ctx_cfg.gpu_virgl_flags.is_some() {
+            let control = Arc::new(DisplayControl::new(&ctx_cfg.vmr.displays));
+            DISPLAY_CONTROLS
+                .lock()
+                .unwrap()
+                .insert(ctx_id, control.clone());
+            ctx_cfg.vmr.display_control = Some(control);
+        }
+        Self(ctx_id)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Drop for DisplayControlRegistration {
+    fn drop(&mut self) {
+        DISPLAY_CONTROLS.lock().unwrap().remove(&self.0);
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[no_mangle]
+pub extern "C" fn krun_display_resize(
+    ctx_id: u32,
+    display_id: u32,
+    width: u32,
+    height: u32,
+    width_mm: u16,
+    height_mm: u16,
+) -> i32 {
+    let resize = DisplayResize {
+        display_id,
+        width,
+        height,
+        width_mm,
+        height_mm,
+    };
+    // Lock order: CTX_MAP, then DISPLAY_CONTROLS (as in krun_start_enter).
+    let mut ctx_map = CTX_MAP.lock().unwrap();
+    let result = if let Some(cfg) = ctx_map.get_mut(&ctx_id) {
+        // Not started yet: change the configuration.
+        if cfg.gpu_virgl_flags.is_none() {
+            return -libc::ENODEV;
+        }
+        match cfg.vmr.displays.get_mut(display_id as usize) {
+            Some(display) => display.resize(&resize).map(|_| ()),
+            None => Err(DisplayResizeError::InvalidDisplay),
+        }
+    } else {
+        match DISPLAY_CONTROLS.lock().unwrap().get(&ctx_id) {
+            Some(control) => control.request_resize(resize),
+            None => return -libc::ENODEV,
+        }
+    };
+    match result {
+        Ok(()) => KRUN_SUCCESS,
+        Err(e) => {
+            debug!("krun_display_resize({ctx_id}, {resize:?}): {e:?}");
+            -libc::EINVAL
+        }
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+#[no_mangle]
+pub extern "C" fn krun_display_resize(
+    _ctx_id: u32,
+    _display_id: u32,
+    _width: u32,
+    _height: u32,
+    _width_mm: u16,
+    _height_mm: u16,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
+/// virglrenderer's `uint64_t virgl_steamac_cmd_count(void)` (dispatched Venus commands,
+/// steamac virglrenderer patch 0009); None with a virglrenderer that does not export it.
+#[cfg(feature = "gpu")]
+static VIRGL_CMD_COUNT: std::sync::LazyLock<Option<extern "C" fn() -> u64>> =
+    std::sync::LazyLock::new(|| {
+        // SAFETY: dlsym with a NUL-terminated name.
+        let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"virgl_steamac_cmd_count".as_ptr()) };
+        if sym.is_null() {
+            warn!("virglrenderer has no virgl_steamac_cmd_count: krun_gpu_get_activity reports no ring commands");
+            None
+        } else {
+            // SAFETY: the exported symbol has this signature.
+            Some(unsafe { std::mem::transmute::<*mut libc::c_void, extern "C" fn() -> u64>(sym) })
+        }
+    });
+
+#[cfg(feature = "gpu")]
+fn virgl_cmd_count() -> Option<u64> {
+    VIRGL_CMD_COUNT.map(|f| f())
+}
+
+#[cfg(feature = "gpu")]
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_gpu_get_activity(
+    ctx_id: u32,
+    ctrl_cmds: *mut u64,
+    ring_cmds: *mut u64,
+) -> i32 {
+    let Some(ctrl) = DISPLAY_CONTROLS
+        .lock()
+        .unwrap()
+        .get(&ctx_id)
+        .map(|c| c.ctrl_commands())
+    else {
+        return -libc::ENODEV;
+    };
+    let ring = virgl_cmd_count();
+    if !ctrl_cmds.is_null() {
+        *ctrl_cmds = ctrl;
+    }
+    if !ring_cmds.is_null() {
+        *ring_cmds = ring.unwrap_or(0);
+    }
+    if ring.is_some() {
+        KRUN_SUCCESS
+    } else {
+        -libc::ENOTSUP
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_gpu_get_activity(
+    _ctx_id: u32,
+    _ctrl_cmds: *mut u64,
+    _ring_cmds: *mut u64,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_snd_device(ctx_id: u32, enable: bool) -> i32 {
@@ -1880,6 +2035,208 @@ pub unsafe extern "C" fn krun_set_snd_device(ctx_id: u32, enable: bool) -> i32 {
     }
 
     KRUN_SUCCESS
+}
+
+/// Audio controls of started VMs with a virtio-snd device (krun_snd_set_*).
+#[cfg(feature = "snd")]
+static SND_CONTROLS: Lazy<Mutex<HashMap<u32, std::sync::Arc<devices::virtio::SndControl>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// A started context's entry in SND_CONTROLS, removed when krun_start_enter returns.
+#[cfg(feature = "snd")]
+struct SndControlRegistration(u32);
+
+#[cfg(feature = "snd")]
+impl SndControlRegistration {
+    fn new(ctx_id: u32, ctx_cfg: &mut ContextConfig) -> Self {
+        if ctx_cfg.enable_snd {
+            SND_CONTROLS
+                .lock()
+                .unwrap()
+                .insert(ctx_id, ctx_cfg.snd_control.clone());
+            ctx_cfg.vmr.snd_control = Some(ctx_cfg.snd_control.clone());
+        }
+        Self(ctx_id)
+    }
+}
+
+#[cfg(feature = "snd")]
+impl Drop for SndControlRegistration {
+    fn drop(&mut self) {
+        SND_CONTROLS.lock().unwrap().remove(&self.0);
+    }
+}
+
+/// Runs `f` on the audio controls of a configured or started context.
+#[cfg(all(feature = "snd", target_os = "macos"))]
+fn with_snd_control(ctx_id: u32, f: impl FnOnce(&devices::virtio::SndControl) -> i32) -> i32 {
+    // Lock order: CTX_MAP, then SND_CONTROLS (as in krun_start_enter).
+    let ctx_map = CTX_MAP.lock().unwrap();
+    if let Some(cfg) = ctx_map.get(&ctx_id) {
+        return if cfg.enable_snd {
+            f(&cfg.snd_control)
+        } else {
+            -libc::ENODEV
+        };
+    }
+    match SND_CONTROLS.lock().unwrap().get(&ctx_id) {
+        Some(control) => f(control),
+        None => -libc::ENODEV,
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_snd_set_output_device(
+    ctx_id: u32,
+    coreaudio_device_uid: *const c_char,
+) -> i32 {
+    #[cfg(all(feature = "snd", target_os = "macos"))]
+    {
+        let uid = if coreaudio_device_uid.is_null() {
+            None
+        } else {
+            match CStr::from_ptr(coreaudio_device_uid).to_str() {
+                Ok(uid) => Some(uid.to_string()),
+                Err(_) => return -libc::EINVAL,
+            }
+        };
+        if uid
+            .as_deref()
+            .is_some_and(|uid| !devices::virtio::snd::output_device_exists(uid))
+        {
+            return -libc::ENODEV;
+        }
+        with_snd_control(ctx_id, |control| {
+            control.set_output_device(uid);
+            KRUN_SUCCESS
+        })
+    }
+    #[cfg(not(all(feature = "snd", target_os = "macos")))]
+    {
+        let _ = (ctx_id, coreaudio_device_uid);
+        -libc::ENOTSUP
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn krun_snd_set_volume(ctx_id: u32, gain: f32, mute: bool) -> i32 {
+    #[cfg(all(feature = "snd", target_os = "macos"))]
+    {
+        if !(0.0..=1.0).contains(&gain) {
+            return -libc::EINVAL;
+        }
+        with_snd_control(ctx_id, |control| {
+            control.set_volume(gain, mute);
+            KRUN_SUCCESS
+        })
+    }
+    #[cfg(not(all(feature = "snd", target_os = "macos")))]
+    {
+        let _ = (ctx_id, gain, mute);
+        -libc::ENOTSUP
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn krun_snd_set_buffer_ms(ctx_id: u32, ms: u32) -> i32 {
+    #[cfg(all(feature = "snd", target_os = "macos"))]
+    {
+        if ms > devices::virtio::SndControl::MAX_BUFFER_MS {
+            return -libc::EINVAL;
+        }
+        with_snd_control(ctx_id, |control| {
+            control.set_buffer_ms(ms);
+            KRUN_SUCCESS
+        })
+    }
+    #[cfg(not(all(feature = "snd", target_os = "macos")))]
+    {
+        let _ = (ctx_id, ms);
+        -libc::ENOTSUP
+    }
+}
+
+/// Pause controls of started VMs (krun_pause / krun_resume).
+#[cfg(target_os = "macos")]
+static VM_PAUSES: Lazy<Mutex<HashMap<u32, std::sync::Arc<vmm::VmPause>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// A started context's entry in VM_PAUSES, removed when krun_start_enter returns.
+#[cfg(target_os = "macos")]
+struct VmPauseRegistration(u32);
+
+#[cfg(target_os = "macos")]
+impl VmPauseRegistration {
+    fn new(ctx_id: u32, ctx_cfg: &mut ContextConfig) -> Self {
+        let vcpus = ctx_cfg.vmr.vm_config().vcpu_count.unwrap_or(1) as usize;
+        let pause = std::sync::Arc::new(vmm::VmPause::new(vcpus));
+        VM_PAUSES.lock().unwrap().insert(ctx_id, pause.clone());
+        ctx_cfg.vmr.vm_pause = Some(pause);
+        Self(ctx_id)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for VmPauseRegistration {
+    fn drop(&mut self) {
+        VM_PAUSES.lock().unwrap().remove(&self.0);
+    }
+}
+
+/// Pause (`pause`) or resume a started VM and its audio.
+#[cfg(target_os = "macos")]
+fn set_vm_paused(ctx_id: u32, pause: bool) -> i32 {
+    let Some(vm_pause) = VM_PAUSES.lock().unwrap().get(&ctx_id).cloned() else {
+        return -libc::ENODEV;
+    };
+    #[cfg(feature = "snd")]
+    let snd = SND_CONTROLS.lock().unwrap().get(&ctx_id).cloned();
+    if pause {
+        // vCPUs first: the guest queues no audio once it is stopped, and what it queued last
+        // stays in the host ring until the audio units start again.
+        if vm_pause.pause() {
+            #[cfg(feature = "snd")]
+            if let Some(snd) = snd {
+                snd.set_paused(true);
+            }
+            info!("VM paused");
+        }
+    } else if vm_pause.is_paused() {
+        #[cfg(feature = "snd")]
+        if let Some(snd) = snd {
+            snd.set_paused(false);
+        }
+        vm_pause.resume();
+        info!("VM resumed");
+    }
+    KRUN_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn krun_pause(ctx_id: u32) -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        set_vm_paused(ctx_id, true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ctx_id;
+        -libc::ENOTSUP
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn krun_resume(ctx_id: u32) -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        set_vm_paused(ctx_id, false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ctx_id;
+        -libc::ENOTSUP
+    }
 }
 
 #[allow(unused_assignments)]
@@ -2892,10 +3249,20 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
 
-    let mut ctx_cfg = match CTX_MAP.lock().unwrap().remove(&ctx_id) {
+    let mut ctx_map = CTX_MAP.lock().unwrap();
+    let mut ctx_cfg = match ctx_map.remove(&ctx_id) {
         Some(ctx_cfg) => ctx_cfg,
         None => return -libc::ENOENT,
     };
+    // Registered while CTX_MAP is still locked, so krun_display_resize always
+    // finds the context in one of the two maps.
+    #[cfg(feature = "gpu")]
+    let _display_control = DisplayControlRegistration::new(ctx_id, &mut ctx_cfg);
+    #[cfg(feature = "snd")]
+    let _snd_control = SndControlRegistration::new(ctx_id, &mut ctx_cfg);
+    #[cfg(target_os = "macos")]
+    let _vm_pause = VmPauseRegistration::new(ctx_id, &mut ctx_cfg);
+    drop(ctx_map);
 
     if ctx_cfg.vmr.external_kernel.is_none()
         && ctx_cfg.vmr.kernel_bundle.is_none()

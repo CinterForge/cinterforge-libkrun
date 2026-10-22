@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::io::IoSliceMut;
-#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -19,18 +18,18 @@ use krun_display::{
     DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
 };
 use libc::c_void;
-#[cfg(target_os = "macos")]
-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_APPLE;
 #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
 #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
+#[cfg(target_os = "macos")]
+use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
 #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
 use rutabaga_gfx::{
     ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder, RutabagaChannel,
-    RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D, RUTABAGA_CHANNEL_TYPE_WAYLAND,
-    RUTABAGA_MAP_CACHE_MASK,
+    RutabagaFence, RutabagaFenceHandler, RutabagaIovec, RutabagaResult, Transfer3D,
+    RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK,
 };
 use rutabaga_gfx::{RutabagaDescriptor, RutabagaFromRawDescriptor};
 #[cfg(target_os = "linux")]
@@ -43,7 +42,7 @@ use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
 
 use super::{GpuError, Result};
-use crate::virtio::display::DisplayInfo;
+use crate::virtio::display::{DisplayInfo, DisplayResize, DisplayResizeError};
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
@@ -110,6 +109,16 @@ impl AssociatedScanouts {
     }
 }
 
+/// Host view of a blob that virglrenderer exported as a shared-memory fd: the
+/// fd mapped into the VMM, which is what the hypervisor maps into the guest and
+/// what a blob scanout is read from.
+#[cfg(target_os = "macos")]
+#[derive(Copy, Clone)]
+struct HostMapping {
+    addr: u64,
+    len: u64,
+}
+
 #[derive(Copy, Clone)]
 struct VirtioGpuResource {
     id: u32,
@@ -120,6 +129,8 @@ struct VirtioGpuResource {
     size: u64, // only for blob resources
     shmem_offset: Option<u64>,
     rutabaga_external_mapping: bool,
+    #[cfg(target_os = "macos")]
+    host_mapping: Option<HostMapping>,
 }
 
 impl VirtioGpuResource {
@@ -141,17 +152,89 @@ impl VirtioGpuResource {
             format,
             shmem_offset: None,
             rutabaga_external_mapping: false,
+            #[cfg(target_os = "macos")]
+            host_mapping: None,
         }
     }
 }
 
+#[cfg(target_os = "macos")]
+fn host_page_size() -> u64 {
+    // SAFETY: sysconf has no memory-safety preconditions.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
+
+/// Where a scanout's pixels live in a blob resource (SET_SCANOUT_BLOB): the
+/// first visible pixel and the distance between rows, in bytes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct BlobScanout {
+    offset: u64,
+    stride: u32,
+}
+
+#[derive(Copy, Clone)]
 pub struct VirtioGpuScanout {
     resource_id: u32,
+    width: u32,
+    height: u32,
+    format: ResourceFormat,
+    blob: Option<BlobScanout>,
+}
+
+/// Copies `rows` rows of `dst.len() / rows` bytes, the first one at `offset` and
+/// each next one `stride` bytes further, out of memory made of the host regions
+/// `(address, length)` laid end to end. Returns false if the rows run past the
+/// end of the regions.
+fn copy_blob_rows(
+    regions: &[(usize, usize)],
+    offset: u64,
+    stride: u64,
+    rows: usize,
+    dst: &mut [u8],
+) -> bool {
+    if rows == 0 {
+        return true;
+    }
+    let row_len = dst.len() / rows;
+    // Rows only move forward, so the region search resumes where it stopped.
+    let mut idx = 0;
+    let mut region_start = 0u64;
+    for (y, row) in dst.chunks_exact_mut(row_len).enumerate() {
+        let mut src = offset + y as u64 * stride;
+        let mut copied = 0;
+        while copied < row_len {
+            while idx < regions.len() && src >= region_start + regions[idx].1 as u64 {
+                region_start += regions[idx].1 as u64;
+                idx += 1;
+            }
+            let Some(&(base, len)) = regions.get(idx) else {
+                return false;
+            };
+            let in_region = (src - region_start) as usize;
+            let n = (len - in_region).min(row_len - copied);
+            // SAFETY: [base, base + len) is mapped host memory (guest RAM or a
+            // blob mapping) for the lifetime of the resource, and `row` is a
+            // distinct VMM-owned buffer of at least `copied + n` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (base + in_region) as *const u8,
+                    row.as_mut_ptr().add(copied),
+                    n,
+                )
+            };
+            copied += n;
+            src += n as u64;
+        }
+    }
+    true
 }
 
 pub struct VirtioGpu {
     rutabaga: Rutabaga,
     resources: BTreeMap<u32, VirtioGpuResource>,
+    /// Guest memory behind blob resources created with guest storage (dumb
+    /// buffers, udmabuf), as host `(address, length)` regions.
+    blob_backing: BTreeMap<u32, Vec<(usize, usize)>>,
     fence_state: Arc<Mutex<FenceState>>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
@@ -226,6 +309,28 @@ impl VirtioGpu {
         render_server_fd: Option<RawFd>,
         export_table: Option<ExportTable>,
     ) -> Option<Rutabaga> {
+        // virglrenderer only runs Venus behind its render server (built in thread
+        // mode on macOS), and libkrun never polls the renderer, so fences must be
+        // signaled from virglrenderer's own threads: ASYNC_FENCE_CB calls back
+        // from a per-context sync thread, which virglrenderer only creates
+        // (together with the render server's fence pipe) under THREAD_SYNC.
+        // Without THREAD_SYNC every context fence would wait for a
+        // virgl_renderer_poll() that never comes.
+        #[cfg(target_os = "macos")]
+        let virgl_flags = {
+            const VIRGLRENDERER_THREAD_SYNC: u32 = 1 << 1;
+            const VIRGLRENDERER_VENUS: u32 = 1 << 6;
+            const VIRGLRENDERER_USE_ASYNC_FENCE_CB: u32 = 1 << 8;
+            const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
+            if virgl_flags & VIRGLRENDERER_VENUS != 0 {
+                virgl_flags
+                    | VIRGLRENDERER_RENDER_SERVER
+                    | VIRGLRENDERER_THREAD_SYNC
+                    | VIRGLRENDERER_USE_ASYNC_FENCE_CB
+            } else {
+                virgl_flags
+            }
+        };
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
             Ok(dir) => dir,
             Err(_) => "/run/user/1000".to_string(),
@@ -355,6 +460,7 @@ impl VirtioGpu {
         Self {
             rutabaga,
             resources: Default::default(),
+            blob_backing: Default::default(),
             fence_state,
             scanouts: Default::default(),
             displays,
@@ -438,6 +544,20 @@ impl VirtioGpu {
             self.rutabaga.unmap(resource_id)?;
         }
 
+        #[cfg(target_os = "macos")]
+        if let Some(mapping) = resource.host_mapping {
+            if resource.shmem_offset.is_some() {
+                // The hypervisor still maps these pages into the guest; leak them
+                // rather than leave the guest mapping pointing at freed memory.
+                warn!("resource {resource_id} unreferenced while still mapped into the guest");
+            } else {
+                // SAFETY: the range was mapped by blob_host_mapping and nothing else
+                // refers to it any more.
+                unsafe { libc::munmap(mapping.addr as *mut c_void, mapping.len as usize) };
+            }
+        }
+
+        self.blob_backing.remove(&resource_id);
         self.rutabaga.unref_resource(resource_id)?;
         Ok(OkNoData)
     }
@@ -449,6 +569,103 @@ impl VirtioGpu {
         width: u32,
         height: u32,
     ) -> VirtioGpuResult {
+        let format = match resource_id {
+            0 => None,
+            _ => {
+                let resource = self
+                    .resources
+                    .get(&resource_id)
+                    .ok_or(ErrInvalidResourceId)?;
+                let Some(format) = resource.format else {
+                    warn!("Cannot use resource {resource_id} with unknown format for scanout");
+                    return Err(ErrUnspec);
+                };
+                Some(format)
+            }
+        };
+        self.attach_scanout(scanout_id, resource_id, width, height, format, None)
+    }
+
+    /// SET_SCANOUT_BLOB: scan out a blob resource (a guest dumb/udmabuf buffer, or
+    /// a Venus image exported as a dma-buf). `fb_width`x`fb_height` is the whole
+    /// framebuffer, `rect` the part of it shown on the scanout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_scanout_blob(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        fb_width: u32,
+        fb_height: u32,
+        format: u32,
+        stride: u32,
+        offset: u32,
+        rect: Rect,
+    ) -> VirtioGpuResult {
+        if resource_id == 0 {
+            return self.attach_scanout(scanout_id, 0, 0, 0, None, None);
+        }
+
+        let resource = self
+            .resources
+            .get(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        let Ok(format) = ResourceFormat::try_from(format) else {
+            warn!("Cannot scan out blob {resource_id} with unsupported format {format}");
+            return Err(ErrInvalidParameter);
+        };
+
+        let bpp = ResourceFormat::BYTES_PER_PIXEL as u64;
+        let (x, y, width, height) = (
+            rect.x as u64,
+            rect.y as u64,
+            rect.width as u64,
+            rect.height as u64,
+        );
+        let blob = BlobScanout {
+            offset: offset as u64 + y * stride as u64 + x * bpp,
+            stride,
+        };
+        // The visible rectangle must lie inside the framebuffer, and its last
+        // row inside the blob.
+        let end = blob.offset + height.saturating_sub(1) * stride as u64 + width * bpp;
+        if width == 0
+            || height == 0
+            || x + width > fb_width as u64
+            || y + height > fb_height as u64
+            || (stride as u64) < width * bpp
+            || end > resource.size
+        {
+            warn!(
+                "SET_SCANOUT_BLOB {resource_id}: rect {x},{y} {width}x{height} of a \
+                 {fb_width}x{fb_height} framebuffer at offset {offset} stride {stride} does \
+                 not fit in the {}-byte blob",
+                resource.size
+            );
+            return Err(ErrInvalidParameter);
+        }
+
+        self.attach_scanout(
+            scanout_id,
+            resource_id,
+            rect.width,
+            rect.height,
+            Some(format),
+            Some(blob),
+        )
+    }
+
+    /// Points a scanout at a resource (`resource_id` 0 disables it). The display
+    /// backend is only reconfigured when the scanout's size or format changes,
+    /// not on every page flip between same-sized buffers.
+    fn attach_scanout(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        format: Option<ResourceFormat>,
+        blob: Option<BlobScanout>,
+    ) -> VirtioGpuResult {
         let scanout = self
             .scanouts
             .get_mut(scanout_id as usize)
@@ -456,77 +673,90 @@ impl VirtioGpu {
 
         // If a resource is already associated with this scanout, make sure to disable
         // this scanout for that resource
-        if let Some(resource_id) = scanout.as_ref().map(|scanout| scanout.resource_id) {
-            let resource = self
-                .resources
-                .get_mut(&resource_id)
-                .ok_or(ErrInvalidResourceId)?;
-
-            resource.scanouts.disable(scanout_id);
+        let previous = *scanout;
+        if let Some(previous) = previous {
+            if let Some(resource) = self.resources.get_mut(&previous.resource_id) {
+                resource.scanouts.disable(scanout_id);
+            }
         }
 
         // Virtio spec: "The driver can use resource_id = 0 to disable a scanout."
-        if resource_id == 0 {
+        let Some(format) = format.filter(|_| resource_id != 0) else {
             debug!("Disabling scanout {scanout_id:?}");
             *scanout = None;
             self.display_backend.disable_scanout(scanout_id)?;
             return Ok(OkNoData);
-        }
+        };
 
-        // Enable the scanout
         let resource = self
             .resources
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
+
+        let unchanged =
+            previous.is_some_and(|p| p.width == width && p.height == height && p.format == format);
+        if !unchanged {
+            let display_info = self
+                .displays
+                .get(scanout_id as usize)
+                .ok_or(ErrInvalidScanoutId)?;
+            self.display_backend.configure_scanout(
+                scanout_id,
+                display_info.width,
+                display_info.height,
+                width,
+                height,
+                format,
+            )?;
+        }
+
         resource.scanouts.enable(scanout_id);
-
-        let Some(format) = resource.format else {
-            warn!("Cannot use resource {resource_id} with unknown format for scanout");
-            return Err(ErrUnspec);
-        };
-
-        let display_info = self
-            .displays
-            .get(scanout_id as usize)
-            .ok_or(ErrInvalidScanoutId)?;
-
-        self.display_backend.configure_scanout(
-            scanout_id,
-            display_info.width,
-            display_info.height,
+        *scanout = Some(VirtioGpuScanout {
+            resource_id,
             width,
             height,
             format,
-        )?;
-
-        *scanout = Some(VirtioGpuScanout { resource_id });
+            blob,
+        });
         Ok(OkNoData)
     }
 
+    // The resource can be larger than the scanout, but the frame only holds
+    // the scanout.
     fn read_2d_resource(
         rutabaga: &mut Rutabaga,
         resource: VirtioGpuResource,
+        scanout: &VirtioGpuScanout,
         output: &mut [u8],
-    ) -> VirtioGpuResult {
+    ) -> RutabagaResult<()> {
         let transfer = Transfer3D {
             x: 0,
             y: 0,
             z: 0,
-            w: resource.width,
-            h: resource.height,
+            w: scanout.width.min(resource.width),
+            h: scanout.height.min(resource.height),
             d: 1,
             level: 0,
-            stride: resource.width * ResourceFormat::BYTES_PER_PIXEL as u32,
+            stride: scanout.width * ResourceFormat::BYTES_PER_PIXEL as u32,
             layer_stride: 0,
             offset: 0,
         };
 
-        rutabaga
-            .transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
-            .map_err(|e| format!("{e}"))
-            .unwrap();
+        rutabaga.transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
+    }
 
-        Ok(OkNoData)
+    /// The host memory holding a blob scanout's pixels, when it is not the guest
+    /// pages of a blob with guest storage: (macOS) the blob's shm mapping. Venus
+    /// memory the guest exports is always shm, device-local or not, so its
+    /// contents are readable here once the guest's rendering fence has signaled.
+    fn blob_host_region(&mut self, resource_id: u32) -> Option<[(usize, usize); 1]> {
+        #[cfg(target_os = "macos")]
+        if let Ok(mapping) = self.blob_host_mapping(resource_id) {
+            return Some([(mapping.addr as usize, mapping.len as usize)]);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = resource_id;
+        None
     }
 
     /// If the resource is the scanout resource, flush it to the display.
@@ -541,13 +771,57 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         for scanout_id in resource.scanouts.iter_enabled() {
+            let Some(Some(scanout)) = self.scanouts.get(scanout_id as usize).copied() else {
+                continue;
+            };
+
+            let host_region = match scanout.blob {
+                Some(_) if !self.blob_backing.contains_key(&resource_id) => {
+                    let Some(region) = self.blob_host_region(resource_id) else {
+                        error!("blob {resource_id} on scanout {scanout_id} has no host memory");
+                        return Err(ErrUnspec);
+                    };
+                    Some(region)
+                }
+                _ => None,
+            };
+
             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
-            if let Err(e) = Self::read_2d_resource(&mut self.rutabaga, resource, buffer) {
+            let read = match scanout.blob {
+                Some(blob) => {
+                    let regions: &[(usize, usize)] = match &host_region {
+                        Some(region) => region,
+                        None => self
+                            .blob_backing
+                            .get(&resource_id)
+                            .map_or(&[], Vec::as_slice),
+                    };
+                    let rows = scanout.height as usize;
+                    let frame_len = scanout.width as usize * ResourceFormat::BYTES_PER_PIXEL * rows;
+                    let buffer_len = buffer.len();
+                    match buffer.get_mut(..frame_len) {
+                        None => Err(format!("{buffer_len}-byte frame is too small")),
+                        Some(frame) => {
+                            if copy_blob_rows(regions, blob.offset, blob.stride as u64, rows, frame)
+                            {
+                                Ok(())
+                            } else {
+                                Err("blob is shorter than the scanout".to_string())
+                            }
+                        }
+                    }
+                }
+                None => Self::read_2d_resource(&mut self.rutabaga, resource, &scanout, buffer)
+                    .map_err(|e| e.to_string()),
+            };
+            // Present the frame even if the read failed: the display API has no
+            // way to release it, and a backend may not hand out another one.
+            self.display_backend
+                .present_frame(scanout_id, frame_id, Some(&rect))?;
+            if let Err(e) = read {
                 log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
                 return Err(ErrUnspec);
             }
-            self.display_backend
-                .present_frame(scanout_id, frame_id, Some(&rect))?
         }
 
         #[cfg(windows)]
@@ -577,6 +851,26 @@ impl VirtioGpu {
             .ok_or(ErrInvalidScanoutId)?;
 
         Ok(OkEdid(display.edid_bytes()))
+    }
+
+    /// Changes a display's size and EDID. The scanout keeps its resource until
+    /// the driver sets one of the new size, which reconfigures the backend.
+    pub fn resize_display(
+        &mut self,
+        resize: &DisplayResize,
+    ) -> std::result::Result<bool, DisplayResizeError> {
+        let display = self
+            .displays
+            .get_mut(resize.display_id as usize)
+            .ok_or(DisplayResizeError::InvalidDisplay)?;
+        let changed = display.resize(resize)?;
+        if changed {
+            info!(
+                "display {}: {}x{} px, {}x{} mm",
+                resize.display_id, resize.width, resize.height, resize.width_mm, resize.height_mm
+            );
+        }
+        Ok(changed)
     }
 
     /// Copies data to host resource from the attached iovecs. Can also be used to flush caches.
@@ -742,11 +1036,19 @@ impl VirtioGpu {
         let mut rutabaga_iovecs = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
-            panic!("GUEST_HANDLE unimplemented");
+            // Never negotiated (VIRTIO_GPU_F_CREATE_GUEST_HANDLE is not offered).
+            warn!("resource {resource_id}: CREATE_GUEST_HANDLE blobs are not supported");
+            return Err(ErrInvalidParameter);
         } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
             rutabaga_iovecs =
                 Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
         }
+        let backing: Option<Vec<(usize, usize)>> = rutabaga_iovecs.as_ref().map(|iovecs| {
+            iovecs
+                .iter()
+                .map(|iovec| (iovec.base as usize, iovec.len))
+                .collect()
+        });
 
         self.rutabaga.resource_create_blob(
             ctx_id,
@@ -760,6 +1062,9 @@ impl VirtioGpu {
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
+        if let Some(backing) = backing {
+            self.blob_backing.insert(resource_id, backing);
+        }
         Ok(self.result_from_query(resource_id))
     }
 
@@ -907,6 +1212,104 @@ impl VirtioGpu {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
         })
     }
+
+    /// Maps the shared memory behind a blob into the VMM, once per resource.
+    ///
+    /// virglrenderer hands out host-visible and exportable Venus memory (and its
+    /// own shm blobs, e.g. the Venus rings) as a POSIX shm fd. The mapping spans
+    /// whole host pages; if the fd is shorter than that, the tail stays
+    /// anonymous zero pages rather than faulting.
+    #[cfg(target_os = "macos")]
+    fn blob_host_mapping(
+        &mut self,
+        resource_id: u32,
+    ) -> std::result::Result<HostMapping, GpuResponse> {
+        let resource = self
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        if let Some(mapping) = resource.host_mapping {
+            return Ok(mapping);
+        }
+
+        let export = self.rutabaga.export_blob(resource_id).map_err(|e| {
+            debug!("resource {resource_id} cannot be exported: {e}");
+            ErrUnspec
+        })?;
+        if export.handle_type != RUTABAGA_MEM_HANDLE_TYPE_SHM {
+            error!(
+                "resource {resource_id}: unsupported blob handle type {:#x}",
+                export.handle_type
+            );
+            return Err(ErrUnspec);
+        }
+        let fd = export.os_handle.as_raw_fd();
+
+        let page_size = host_page_size();
+        let len = resource.size.div_ceil(page_size) * page_size;
+        if len == 0 {
+            return Err(ErrUnspec);
+        }
+        // SAFETY: an all-zero stat is a valid out-parameter for fstat.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fd is a valid descriptor owned by `export`.
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            error!("resource {resource_id}: fstat on the blob fd failed");
+            return Err(ErrUnspec);
+        }
+        let file_len = (stat.st_size.max(0) as u64).min(len) / page_size * page_size;
+        if file_len == 0 {
+            error!("resource {resource_id}: blob fd is empty");
+            return Err(ErrUnspec);
+        }
+        if file_len < len {
+            warn!(
+                "resource {resource_id}: blob fd holds {file_len} bytes, resource is {}",
+                resource.size
+            );
+        }
+
+        // SAFETY: a fresh anonymous mapping; no existing memory is touched.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            error!("resource {resource_id}: cannot reserve {len} bytes");
+            return Err(ErrUnspec);
+        }
+        // SAFETY: replaces the start of the reservation made just above.
+        let ret = unsafe {
+            libc::mmap(
+                addr,
+                file_len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd,
+                0,
+            )
+        };
+        if ret == libc::MAP_FAILED {
+            error!("resource {resource_id}: cannot map the blob fd");
+            // SAFETY: the reservation made above, unused.
+            unsafe { libc::munmap(addr, len as usize) };
+            return Err(ErrUnspec);
+        }
+
+        let mapping = HostMapping {
+            addr: addr as u64,
+            len,
+        };
+        resource.host_mapping = Some(mapping);
+        Ok(mapping)
+    }
+
     #[cfg(target_os = "macos")]
     pub fn resource_map_blob(
         &mut self,
@@ -914,44 +1317,47 @@ impl VirtioGpu {
         shm_region: &VirtioShmRegion,
         offset: u64,
     ) -> VirtioGpuResult {
+        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+        let mapping = self.blob_host_mapping(resource_id)?;
         let resource = self
             .resources
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-        let map_ptr = self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
+        let guest_addr = checked_blob_map_addr(
+            shm_region.guest_addr,
+            offset,
+            resource.size,
+            shm_region.size as u64,
+        )
+        .ok_or(ErrUnspec)?;
+        // hv_vm_map works in host pages. Rounding up here would map over the
+        // guest's next blob, so a guest that ignores VIRTIO_GPU_F_BLOB_ALIGNMENT
+        // gets an error instead.
+        let page_size = host_page_size();
+        if guest_addr % page_size != 0 || resource.size % page_size != 0 {
+            error!(
+                "resource {resource_id}: blob at {guest_addr:#x} size {:#x} is not aligned to \
+                 the {page_size:#x} host page (guest ignores VIRTIO_GPU_F_BLOB_ALIGNMENT)",
+                resource.size
+            );
+            return Err(ErrUnspec);
+        }
+        debug!(
+            "mapping: host_addr={:x}, guest_addr={:x}, size={}",
+            mapping.addr, guest_addr, resource.size
+        );
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
-                let guest_addr = checked_blob_map_addr(
-                    shm_region.guest_addr,
-                    offset,
-                    resource.size,
-                    shm_region.size as u64,
-                )
-                .ok_or(ErrUnspec)?;
-                debug!(
-                    "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
-                    map_ptr, guest_addr, resource.size
-                );
-
-                let (reply_sender, reply_receiver) = unbounded();
-                self.map_sender
-                    .send(WorkerMessage::GpuAddMapping(
-                        reply_sender,
-                        map_ptr,
-                        guest_addr,
-                        resource.size,
-                    ))
-                    .unwrap();
-                if !reply_receiver.recv().unwrap() {
-                    return Err(ErrUnspec);
-                }
-            } else {
-                return Err(ErrUnspec);
-            }
-        } else {
+        let (reply_sender, reply_receiver) = unbounded();
+        self.map_sender
+            .send(WorkerMessage::GpuAddMapping(
+                reply_sender,
+                mapping.addr,
+                guest_addr,
+                resource.size,
+            ))
+            .unwrap();
+        if !reply_receiver.recv().unwrap() {
             return Err(ErrUnspec);
         }
 
@@ -1105,5 +1511,85 @@ mod test {
             .filter(|&i| i % 2 != 0)
             .for_each(|scanout| scanouts.disable(scanout));
         assert!(!scanouts.has_any_enabled());
+    }
+
+    #[test]
+    fn test_read_2d_resource_larger_than_scanout() {
+        use super::{VirtioGpu, VirtioGpuResource, VirtioGpuScanout};
+        use rutabaga_gfx::{
+            ResourceCreate3D, RutabagaBuilder, RutabagaComponentType, RutabagaFenceHandler,
+            RutabagaIovec, Transfer3D, RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D,
+        };
+
+        let mut rutabaga = RutabagaBuilder::new(RutabagaComponentType::Rutabaga2D, 0, 0)
+            .build(RutabagaFenceHandler::new(|_| {}), None)
+            .unwrap();
+        let (width, height) = (4, 2);
+        rutabaga
+            .resource_create_3d(
+                1,
+                ResourceCreate3D {
+                    target: RUTABAGA_PIPE_TEXTURE_2D,
+                    format: 1,
+                    bind: RUTABAGA_PIPE_BIND_RENDER_TARGET,
+                    width,
+                    height,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: 0,
+                },
+            )
+            .unwrap();
+        let mut guest: Vec<u8> = (0..width * height * 4).map(|b| b as u8).collect();
+        rutabaga
+            .attach_backing(
+                1,
+                vec![RutabagaIovec {
+                    base: guest.as_mut_ptr().cast(),
+                    len: guest.len(),
+                }],
+            )
+            .unwrap();
+        rutabaga
+            .transfer_write(0, 1, Transfer3D::new_2d(0, 0, width, height))
+            .unwrap();
+
+        let resource = VirtioGpuResource::new(1, width, height, None, 0);
+        let scanout = VirtioGpuScanout {
+            resource_id: 1,
+            width: 2,
+            height: 2,
+            format: krun_display::ResourceFormat::BGRA,
+            blob: None,
+        };
+        let mut frame = [0u8; 2 * 2 * 4];
+        VirtioGpu::read_2d_resource(&mut rutabaga, resource, &scanout, &mut frame).unwrap();
+
+        let row = |y: usize| &guest[y * 4 * 4..][..2 * 4];
+        assert_eq!(frame[..2 * 4], *row(0));
+        assert_eq!(frame[2 * 4..], *row(1));
+    }
+
+    #[test]
+    fn test_copy_blob_rows_across_regions() {
+        use super::copy_blob_rows;
+
+        // A 3x3 image (4 bytes per pixel) with a 16-byte stride, split over
+        // three uneven regions, read from a 2x2 window at (1, 1).
+        let blob: Vec<u8> = (0..48).collect();
+        let regions = [
+            (blob.as_ptr() as usize, 7),
+            (blob[7..].as_ptr() as usize, 20),
+            (blob[27..].as_ptr() as usize, 21),
+        ];
+        let mut frame = [0u8; 2 * 2 * 4];
+        assert!(copy_blob_rows(&regions, 16 + 4, 16, 2, &mut frame));
+        assert_eq!(frame[..8], blob[20..28]);
+        assert_eq!(frame[8..], blob[36..44]);
+
+        // A row past the end of the regions is refused.
+        assert!(!copy_blob_rows(&regions, 32 + 4, 16, 2, &mut frame));
     }
 }

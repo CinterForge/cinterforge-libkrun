@@ -35,6 +35,8 @@ pub mod worker;
 
 #[cfg(target_os = "macos")]
 use macos::vstate;
+#[cfg(target_os = "macos")]
+pub use macos::vstate::VmPause;
 
 use std::fmt::{Display, Formatter};
 use std::io;

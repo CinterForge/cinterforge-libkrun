@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use utils::eventfd::EventFd;
@@ -7,7 +8,7 @@ use vm_memory::{ByteValued, GuestMemoryMmap};
 use super::super::{ActivateError, ActivateResult, DeviceQueue, QueueConfig, VirtioDevice};
 use super::virtio_sound::VirtioSoundConfig;
 use super::worker::SndWorker;
-use super::{defs, defs::uapi, Error};
+use super::{defs, defs::uapi, Error, SndControl};
 
 use crate::virtio::{DeviceState, InterruptTransport};
 
@@ -21,10 +22,11 @@ pub struct Snd {
     pub(crate) device_state: DeviceState,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
+    control: Arc<SndControl>,
 }
 
 impl Snd {
-    pub fn new() -> super::Result<Snd> {
+    pub fn new(control: Arc<SndControl>) -> super::Result<Snd> {
         Ok(Snd {
             avail_features: AVAIL_FEATURES,
             acked_features: 0,
@@ -34,6 +36,7 @@ impl Snd {
             worker_thread: None,
             worker_stopfd: EventFd::new(utils::eventfd::EFD_NONBLOCK)
                 .map_err(Error::EventFdCreate)?,
+            control,
         })
     }
 
@@ -71,7 +74,16 @@ impl VirtioDevice for Snd {
         let config = VirtioSoundConfig {
             jacks: 0.into(),
             streams: 2.into(),
-            chmaps: 1.into(),
+            chmaps: {
+                #[cfg(target_os = "macos")]
+                {
+                    (self.control.playback_maps().len() as u32 + 2).into()
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    2.into()
+                }
+            },
         };
 
         let config_slice = config.as_slice();
@@ -119,6 +131,7 @@ impl VirtioDevice for Snd {
             interrupt.clone(),
             mem.clone(),
             self.worker_stopfd.try_clone().unwrap(),
+            self.control.clone(),
         );
         self.worker_thread = Some(worker.run());
 

@@ -70,9 +70,9 @@ use crate::vstate::{Error as VstateError, Vcpu, VcpuConfig, Vm};
 use arch::{ArchMemoryInfo, InitrdConfig};
 use device_manager::shm::ShmManager;
 #[cfg(feature = "gpu")]
-use devices::virtio::display::DisplayInfo;
-#[cfg(feature = "gpu")]
 use devices::virtio::display::NoopDisplayBackend;
+#[cfg(feature = "gpu")]
+use devices::virtio::display::{DisplayControl, DisplayInfo};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::{fs::ExportTable, VirtioShmRegion};
 use flate2::read::GzDecoder;
@@ -909,6 +909,11 @@ pub fn build_microvm(
             Arc::new(Mutex::new(gic))
         };
 
+        let vm_pause = vm_resources.vm_pause.clone().unwrap_or_else(|| {
+            Arc::new(crate::VmPause::new(
+                vm_resources.vm_config().vcpu_count.unwrap() as usize,
+            ))
+        });
         vcpus = create_vcpus_aarch64(
             &vm,
             &vcpu_config,
@@ -917,6 +922,7 @@ pub fn build_microvm(
             &exit_evt,
             vcpu_list.clone(),
             vm_resources.nested_enabled,
+            vm_pause,
         )
         .map_err(StartMicrovmError::Internal)?;
 
@@ -1018,6 +1024,10 @@ pub fn build_microvm(
         let display_backend = vm_resources
             .display_backend
             .unwrap_or_else(|| NoopDisplayBackend::into_display_backend(None));
+        let display_control = vm_resources
+            .display_control
+            .clone()
+            .unwrap_or_else(|| Arc::new(DisplayControl::new(&vm_resources.displays)));
 
         attach_gpu_device(
             &mut vmm,
@@ -1029,6 +1039,7 @@ pub fn build_microvm(
             vm_resources.gpu_render_server_fd,
             Box::from(&vm_resources.displays[..]),
             display_backend,
+            display_control,
             #[cfg(target_os = "macos")]
             _sender.clone(),
         )?;
@@ -1074,7 +1085,8 @@ pub fn build_microvm(
 
     #[cfg(feature = "snd")]
     if vm_resources.snd_device {
-        attach_snd_device(&mut vmm, intc.clone())?;
+        let control = vm_resources.snd_control.clone().unwrap_or_default();
+        attach_snd_device(&mut vmm, intc.clone(), control)?;
     }
 
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
@@ -1794,6 +1806,7 @@ fn create_vcpus_aarch64(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 fn create_vcpus_aarch64(
     _vm: &Vm,
     vcpu_config: &VcpuConfig,
@@ -1802,6 +1815,7 @@ fn create_vcpus_aarch64(
     exit_evt: &EventFd,
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    vm_pause: Arc<crate::VmPause>,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
@@ -1822,6 +1836,7 @@ fn create_vcpus_aarch64(
             exit_evt.try_clone().map_err(Error::EventFd)?,
             vcpu_list.clone(),
             nested_enabled,
+            vm_pause.clone(),
         )
         .map_err(Error::Vcpu)?;
 
@@ -2280,6 +2295,7 @@ fn attach_gpu_device(
     render_server_fd: Option<RawFd>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
+    display_control: Arc<DisplayControl>,
     #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
@@ -2290,6 +2306,7 @@ fn attach_gpu_device(
             render_server_fd,
             displays,
             display_backend,
+            display_control,
             #[cfg(target_os = "macos")]
             map_sender,
         )
@@ -2344,10 +2361,14 @@ fn attach_input_devices(
 }
 
 #[cfg(feature = "snd")]
-fn attach_snd_device(vmm: &mut Vmm, intc: IrqChip) -> std::result::Result<(), StartMicrovmError> {
+fn attach_snd_device(
+    vmm: &mut Vmm,
+    intc: IrqChip,
+    control: Arc<devices::virtio::SndControl>,
+) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    let snd = Arc::new(Mutex::new(devices::virtio::Snd::new().unwrap()));
+    let snd = Arc::new(Mutex::new(devices::virtio::Snd::new(control).unwrap()));
     let id = String::from(snd.lock().unwrap().id());
 
     // The device mutex mustn't be locked here otherwise it will deadlock.

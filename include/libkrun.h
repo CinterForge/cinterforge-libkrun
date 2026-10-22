@@ -727,6 +727,65 @@ int32_t krun_display_set_dpi(uint32_t ctx_id, uint32_t display_id, uint32_t dpi)
 int32_t krun_display_set_physical_size(uint32_t ctx_id, uint32_t display_id, uint16_t width_mm, uint16_t height_mm);
 
 /**
+ * Change the size of a display, also while the VM runs.
+ *
+ * Sets the display to "width" x "height" pixels and regenerates its EDID: the preferred
+ * detailed timing becomes the new size at the configured refresh rate, with "width_mm" x
+ * "height_mm" as the physical size (replacing a size set with krun_display_set_dpi() or
+ * krun_display_set_physical_size()). To keep the guest's UI scale while resizing, scale the
+ * physical size with the pixel size.
+ *
+ * Before krun_start_enter() this changes the configuration. Afterwards it may be called from
+ * any thread: the request is queued for the virtio-gpu device, which applies it and notifies
+ * the guest driver (VIRTIO_GPU_EVENT_DISPLAY + configuration change interrupt; Linux then
+ * re-reads the display info and EDID and sends a DRM hotplug event). Requests queued before
+ * the device handles them are applied in order with a single notification, so the guest only
+ * sees the last size of a burst. Requesting the current size and physical size again is a
+ * no-op for the guest. The guest switches its mode on its own; until then it keeps scanning
+ * out at the old size.
+ *
+ * Arguments:
+ *  "ctx_id"      - the configuration context ID.
+ *  "display_id"  - the ID of the display (range: 0 to KRUN_MAX_DISPLAYS - 1)
+ *  "width"       - new width in pixels, 1..4095 (EDID detailed timing limit)
+ *  "height"      - new height in pixels, 1..4095
+ *  "width_mm"    - physical width in millimeters, 0..4095 (0: unknown)
+ *  "height_mm"   - physical height in millimeters, 0..4095 (0: unknown)
+ *
+ * Returns:
+ *  Zero if the change was applied (before start) or queued (running VM), or a negative error number:
+ *  -ENODEV  no such context, or the context has no virtio-gpu (krun_set_gpu_options*())
+ *  -EINVAL  no such display, a size out of range, or the display has a fixed EDID
+ *           (krun_display_set_edid())
+ *  -ENOTSUP libkrun was built without GPU support
+ */
+int32_t krun_display_resize(uint32_t ctx_id, uint32_t display_id, uint32_t width, uint32_t height,
+                            uint16_t width_mm, uint16_t height_mm);
+
+/**
+ * Read the GPU activity counters of a running VM (any thread, cheap: two relaxed loads).
+ * Both are running totals (ring commands count every context of the process); a host
+ * compares two readings to tell whether the guest sent any GPU work in between.
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID of a VM in krun_start_enter().
+ *  "ctrl_cmds" - (may be NULL) virtio-gpu control-queue commands taken by the GPU worker
+ *                (SUBMIT_3D, RESOURCE_FLUSH, SET_SCANOUT*, transfers, ...; the cursor
+ *                queue is not counted).
+ *  "ring_cmds" - (may be NULL) Venus commands virglrenderer dispatched, from its in-process
+ *                rings and from SUBMIT_3D buffers (a guest feeding only its Venus rings makes
+ *                progress without control-queue commands). 0 if virglrenderer does not
+ *                export virgl_steamac_cmd_count().
+ *
+ * Returns:
+ *  Zero on success, or a negative error number:
+ *  -ENODEV  no such running context, or the context has no virtio-gpu
+ *  -ENOTSUP libkrun was built without GPU support, or virglrenderer has no command counter
+ *           ("ctrl_cmds" is still valid then)
+ */
+int32_t krun_gpu_get_activity(uint32_t ctx_id, uint64_t *ctrl_cmds, uint64_t *ring_cmds);
+
+/**
  * Configure refresh rate for a display
  *
  *
@@ -794,6 +853,86 @@ int krun_add_input_device_fd(uint32_t ctx_id, int input_fd);
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_set_snd_device(uint32_t ctx_id, bool enable);
+
+/*
+ * Runtime audio controls of the virtio-snd device (macOS CoreAudio backend). Callable from any
+ * thread, before krun_start_enter (applied when the device starts) or while the VM runs.
+ * They return:
+ *   0         on success;
+ *   -ENODEV   no such context, the context has no virtio-snd device (krun_set_snd_device), or
+ *             (krun_snd_set_output_device) no CoreAudio output device with that UID;
+ *   -EINVAL   an argument is out of range;
+ *   -ENOTSUP  libkrun was built without SND=1, or the backend has no such control (Linux).
+ */
+
+/**
+ * Selects the host output device of the guest's playback stream.
+ *
+ * Arguments:
+ *  "ctx_id"               - the configuration context ID.
+ *  "coreaudio_device_uid" - the device's kAudioDevicePropertyDeviceUID (UTF-8), or NULL for the
+ *                           system default output device, which is followed when the user changes
+ *                           it (the default). A running guest stream keeps running: the output
+ *                           unit is restarted on the new device (a short gap, no guest xrun).
+ *                           If a selected device goes away, playback falls back to the system
+ *                           default until it returns.
+ */
+int32_t krun_snd_set_output_device(uint32_t ctx_id, const char *coreaudio_device_uid);
+
+/**
+ * Sets the host-side playback gain, applied on top of the guest's own volume.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "gain"   - linear gain 0.0 .. 1.0 (default 1.0).
+ *  "mute"   - true silences playback (the guest stream keeps running).
+ */
+int32_t krun_snd_set_volume(uint32_t ctx_id, float gain, bool mute);
+
+/**
+ * Sets the playback buffer the host keeps on top of what the guest queues (default 40 ms).
+ * Smaller = lower latency but crackles if the guest is starved of CPU; larger = more robust.
+ * The guest is told the total delay (latency_bytes), so A/V sync stays correct either way.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "ms"     - 0 .. 200.
+ */
+int32_t krun_snd_set_buffer_ms(uint32_t ctx_id, uint32_t ms);
+
+/**
+ * Pause a running VM (macOS): every vCPU leaves the guest and its thread waits, so the VM
+ * runs no guest code and its vCPUs use no CPU; guest memory and all device and host GPU state
+ * stay as they are (in memory, in this process: nothing is saved). The virtio-snd output and
+ * input stop (no sound, no underruns: the guest streams do not advance). Devices that receive
+ * host data (network, console) keep filling the guest's buffers until they are full.
+ * Returns once no vCPU is in the guest (at most about a second). Pausing a paused VM does
+ * nothing.
+ *
+ * The paused interval is hidden from the guest: krun_resume() adds it to the vCPUs' virtual
+ * counter offset, so the guest's monotonic clock, timers and watchdogs see no gap. Its wall
+ * clock (CLOCK_REALTIME) is behind by the paused time until its NTP client corrects it.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID of a VM in krun_start_enter().
+ *
+ * Returns:
+ *  Zero on success, or a negative error number:
+ *  -ENODEV  no such running context
+ *  -ENOTSUP not supported on this platform
+ */
+int32_t krun_pause(uint32_t ctx_id);
+
+/**
+ * Resume a VM paused by krun_pause() (from any thread): audio starts again, then the vCPUs
+ * continue where they stopped. Resuming a running VM does nothing.
+ *
+ * Returns:
+ *  Zero on success, or a negative error number:
+ *  -ENODEV  no such running context
+ *  -ENOTSUP not supported on this platform
+ */
+int32_t krun_resume(uint32_t ctx_id);
 
 /**
  * Configures a map of rlimits to be set in the guest before starting the isolated binary.

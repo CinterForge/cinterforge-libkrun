@@ -257,6 +257,16 @@ impl Console {
             let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
             let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
 
+            // The guest sends PORT_OPEN again on every close/reopen of the port
+            // (one opener at a time in Linux virtio_console). The port's I/O
+            // already owns its queues and keeps running across reopens.
+            if self.queues[rx_idx].is_none() || self.queues[tx_idx].is_none() {
+                log::debug!(
+                    "console port {port_id} reopened by the guest; port io already running"
+                );
+                continue;
+            }
+
             // Take ownership of port queues - they are moved to the port.
             let rx_queue = self.queues[rx_idx]
                 .take()

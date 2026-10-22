@@ -41,7 +41,6 @@ pub const VIRGL_RENDERER_MAP_CACHE_WC: u32 = 3;
 pub const VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF: u32 = 1;
 pub const VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE: u32 = 2;
 pub const VIRGL_RENDERER_BLOB_FD_TYPE_SHM: u32 = 3;
-pub const VIRGL_RENDERER_BLOB_FD_TYPE_APPLE: u32 = 4;
 pub const VIRGL_RENDERER_FENCE_FLAG_MERGEABLE: u32 = 1;
 pub type __int32_t = ::std::os::raw::c_int;
 pub type __uint32_t = ::std::os::raw::c_uint;
@@ -395,13 +394,6 @@ extern "C" {
     pub fn virgl_renderer_resource_get_map_info(
         res_handle: u32,
         map_info: *mut u32,
-    ) -> ::std::os::raw::c_int;
-}
-#[cfg(target_os = "macos")]
-extern "C" {
-    pub fn virgl_renderer_resource_get_map_ptr(
-        res_handle: u32,
-        map_ptr: *mut u64,
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {

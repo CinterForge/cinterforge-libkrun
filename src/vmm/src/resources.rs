@@ -9,6 +9,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
 
 #[cfg(feature = "tee")]
 use serde::{Deserialize, Serialize};
@@ -29,7 +31,7 @@ use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfac
 use crate::vmm_config::vsock::*;
 use crate::vstate::VcpuConfig;
 #[cfg(feature = "gpu")]
-use devices::virtio::display::DisplayInfo;
+use devices::virtio::display::{DisplayControl, DisplayInfo};
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
 #[cfg(feature = "gpu")]
@@ -166,6 +168,9 @@ pub struct VmResources {
     pub display_backend: Option<DisplayBackend<'static>>,
     #[cfg(feature = "gpu")]
     pub displays: Vec<DisplayInfo>,
+    /// Runtime display changes (krun_display_resize), shared with the GPU device.
+    #[cfg(feature = "gpu")]
+    pub display_control: Option<Arc<DisplayControl>>,
     #[cfg(feature = "input")]
     pub input_backends: Vec<(
         krun_input::InputConfigBackend<'static>,
@@ -174,6 +179,12 @@ pub struct VmResources {
     #[cfg(feature = "snd")]
     /// Enable the virtio-snd device.
     pub snd_device: bool,
+    /// Runtime audio settings (krun_snd_set_*), shared with the virtio-snd backend.
+    #[cfg(feature = "snd")]
+    pub snd_control: Option<Arc<devices::virtio::SndControl>>,
+    /// Pause/resume of the running guest (krun_pause / krun_resume), shared with the vCPUs.
+    #[cfg(target_os = "macos")]
+    pub vm_pause: Option<Arc<crate::VmPause>>,
     /// File to send console output.
     pub console_output: Option<PathBuf>,
     /// SMBIOS OEM Strings
@@ -431,10 +442,16 @@ mod tests {
             display_backend: None,
             #[cfg(feature = "gpu")]
             displays: Vec::new(),
+            #[cfg(feature = "gpu")]
+            display_control: None,
             #[cfg(feature = "input")]
             input_backends: Vec::new(),
             #[cfg(feature = "snd")]
             snd_device: false,
+            #[cfg(feature = "snd")]
+            snd_control: None,
+            #[cfg(target_os = "macos")]
+            vm_pause: None,
             console_output: None,
             smbios_oem_strings: None,
             nested_enabled: false,

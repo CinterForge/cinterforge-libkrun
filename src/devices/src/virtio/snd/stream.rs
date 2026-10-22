@@ -7,7 +7,7 @@ use thiserror::Error as ThisError;
 use vm_memory::{Address, Bytes, GuestAddress, Le32, Le64};
 
 use super::super::Descriptor;
-use super::defs::{SUPPORTED_FORMATS, SUPPORTED_RATES};
+use super::defs::{CHANNELS_MAX, CHANNELS_MIN, SUPPORTED_FORMATS, SUPPORTED_RATES};
 use super::{virtio_sound::*, Direction, IOMessage};
 
 /// Stream errors.
@@ -195,8 +195,8 @@ impl Default for Stream {
             formats: SUPPORTED_FORMATS.into(),
             rates: SUPPORTED_RATES.into(),
             params: PcmParams::default(),
-            channels_min: 1,
-            channels_max: 6,
+            channels_min: CHANNELS_MIN,
+            channels_max: CHANNELS_MAX,
             state: Default::default(),
             buffers: VecDeque::new(),
         }
@@ -319,23 +319,15 @@ impl Buffer {
     }
 }
 
+// latency_bytes of a message is the device-side delay the guest adds to its own pointer
+// arithmetic (runtime->delay): the backend stores it in the message before completing it.
 impl Drop for Buffer {
     fn drop(&mut self) {
-        match self.direction {
-            Direction::Input => {
-                let used_len = std::cmp::min(self.pos as u32, self.desc_len());
-                self.message
-                    .used_len
-                    .fetch_add(used_len, std::sync::atomic::Ordering::SeqCst);
-                self.message
-                    .latency_bytes
-                    .fetch_add(used_len, std::sync::atomic::Ordering::SeqCst);
-            }
-            Direction::Output => {
-                self.message
-                    .latency_bytes
-                    .fetch_add(self.desc_len(), std::sync::atomic::Ordering::SeqCst);
-            }
+        if self.direction == Direction::Input {
+            let used_len = std::cmp::min(self.pos as u32, self.desc_len());
+            self.message
+                .used_len
+                .fetch_add(used_len, std::sync::atomic::Ordering::SeqCst);
         }
         log::trace!("dropping {:?} buffer {:?}", self.direction, self);
     }
