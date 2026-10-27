@@ -1,0 +1,15 @@
+// !$*UTF8*$!
+{
+ archiveVersion = 1;
+ classes = {};
+ objectVersion = 60;
+ objects = {
+  9ABE367ED7AACF302995626C /* Live fork source tree */ = {isa = PBXFileSystemSynchronizedRootGroup; name = "src (live)"; path = src; sourceTree = "<group>"; };
+  04DCB7056E5F0E5E22E08131 = {isa = PBXGroup; children = (9ABE367ED7AACF302995626C, ); sourceTree = "<group>"; };
+  5FDA8B842F77D982680D8B0E = {isa = PBXProject; attributes = { LastUpgradeCheck = 1600; }; buildConfigurationList = D3A1CD0D7085F903D975C411; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, ); mainGroup = 04DCB7056E5F0E5E22E08131; projectDirPath = ""; projectRoot = ""; targets = (); };
+  0FBF0D78FDF10B1E3291CD3F = {isa = XCBuildConfiguration; buildSettings = {}; name = Debug; };
+  9955B6A53C4E2D7C708BC740 = {isa = XCBuildConfiguration; buildSettings = {}; name = Release; };
+  D3A1CD0D7085F903D975C411 = {isa = XCConfigurationList; buildConfigurations = (0FBF0D78FDF10B1E3291CD3F, 9955B6A53C4E2D7C708BC740, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+ };
+ rootObject = 5FDA8B842F77D982680D8B0E;
+}
